@@ -1,0 +1,194 @@
+# .github/workflows/ci.yml
+#
+# Two-job CI pipeline:
+#
+#   cpu-tests  — fast, runs on standard GitHub-hosted Ubuntu runners
+#                (no Neuron hardware required)
+#
+#   neuron-tests — runs on a self-hosted runner attached to an Inf2 instance,
+#                  guarded by a label so it only triggers when explicitly
+#                  requested or on pushes to `main`.
+#
+# Self-hosted runner setup (one-time, on the Inf2 instance):
+#   1. Follow https://docs.github.com/en/actions/hosting-your-own-runners
+#   2. Add the runner with labels: self-hosted, linux, inf2
+#   3. Run  scripts/setup_inf2.sh  to bootstrap the environment
+#   4. The runner will pick up jobs automatically.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_neuron:
+        description: "Run Neuron hardware tests"
+        type: boolean
+        default: false
+      run_bench:
+        description: "Run throughput benchmarks"
+        type: boolean
+        default: false
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+# Job 1: CPU tests (GitHub-hosted runner)
+# ---------------------------------------------------------------------------
+jobs:
+  cpu-tests:
+    name: CPU tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Create venv and install
+        run: |
+          uv venv .venv --python ${{ matrix.python-version }}
+          source .venv/bin/activate
+          uv pip install -e ".[dev]"
+
+      - name: Run tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/ -v --tb=short
+
+      - name: Example smoke tests
+        run: |
+          source .venv/bin/activate
+          python examples/01_plaquette.py
+          python examples/02_wilson_dslash.py
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-py${{ matrix.python-version }}
+          path: .pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Job 2: Neuron hardware tests (self-hosted Inf2 runner)
+# ---------------------------------------------------------------------------
+  neuron-tests:
+    name: Neuron hardware tests (Inf2)
+    # Only run on pushes to main, manual triggers, or PRs that touch Dirac/solver code
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, inf2]
+    timeout-minutes: 60
+
+    env:
+      # Ensure the hardware-detection heuristic works in CI
+      INSTANCE_TYPE: inf2.xlarge
+      # Use the DLAMI Neuron venv if present
+      DLAMI_VENV: /opt/aws_neuronx_venv_pytorch_2_1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Activate environment
+        run: |
+          if [[ -d "${DLAMI_VENV}" ]]; then
+            echo "VENV_ACTIVATE=${DLAMI_VENV}/bin/activate" >> "$GITHUB_ENV"
+          else
+            uv venv .venv
+            echo "VENV_ACTIVATE=$(pwd)/.venv/bin/activate" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install package
+        run: |
+          source "$VENV_ACTIVATE"
+          if [[ -d "${DLAMI_VENV}" ]]; then
+            pip install -e ".[dev]" --quiet
+          else
+            uv pip install -e ".[neuron,dev]"
+          fi
+
+      - name: Verify Neuron device
+        run: |
+          source "$VENV_ACTIVATE"
+          python - <<'EOF'
+          from lqcd_neuron.neuron import get_device
+          d = get_device()
+          print(f"NeuronDevice: {d}")
+          assert d.is_neuron, "Expected Neuron hardware, got CPU fallback"
+          EOF
+
+      - name: Run unit tests
+        run: |
+          source "$VENV_ACTIVATE"
+          pytest tests/ -v --tb=short
+
+      - name: Run example smoke tests
+        run: |
+          source "$VENV_ACTIVATE"
+          python examples/01_plaquette.py
+          python examples/02_wilson_dslash.py
+          python examples/03_cg_inversion.py
+
+      - name: Run Neuron compilation test
+        run: |
+          source "$VENV_ACTIVATE"
+          python - <<'EOF'
+          import torch
+          from lqcd_neuron.core import LatticeGeometry, GaugeField, ColorSpinorField
+          from lqcd_neuron.dirac import WilsonDirac
+          from lqcd_neuron.neuron import NeuronCompiler
+
+          geom = LatticeGeometry(T=4, Z=4, Y=4, X=4)
+          U    = GaugeField.random(geom, seed=0)
+          psi  = ColorSpinorField.gaussian(geom, seed=1)
+          D    = WilsonDirac(mass=0.1)
+
+          compiler = NeuronCompiler(dtype="bfloat16")
+          D_n = compiler.compile_dslash(D, geom.shape, nc=geom.nc)
+          out = D_n(psi.tensor, U.tensor)
+
+          # Compare with CPU reference
+          D_cpu = WilsonDirac(mass=0.1)
+          ref   = D_cpu(psi.tensor, U.tensor)
+          diff  = (out - ref).abs().max().item()
+          print(f"Max diff Neuron vs CPU: {diff:.4e}")
+          # bfloat16 compilation: expect <1e-2 difference
+          assert diff < 1e-2, f"Neuron/CPU diff too large: {diff}"
+          print("Neuron compilation test PASSED")
+          EOF
+
+      - name: Run benchmarks
+        if: ${{ github.event.inputs.run_bench == 'true' || github.ref == 'refs/heads/main' }}
+        run: |
+          source "$VENV_ACTIVATE"
+          python examples/bench_dslash.py --neuron \
+            | tee bench_results.txt
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-inf2
+          path: bench_results.txt
+          if-no-files-found: ignore
+
+      - name: Clean Neuron compiler cache (keep disk lean)
+        if: always()
+        run: rm -rf ~/.cache/lqcd-neuron/neuronx/

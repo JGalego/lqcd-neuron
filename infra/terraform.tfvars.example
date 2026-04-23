@@ -1,0 +1,23 @@
+# infra/terraform.tfvars.example
+#
+# Copy this file to terraform.tfvars and fill in your values:
+#
+#   cp infra/terraform.tfvars.example infra/terraform.tfvars
+#
+# terraform.tfvars is gitignored — never commit real values.
+
+aws_region   = "us-east-2"
+instance_type = "inf2.xlarge"   # cheapest Inf2; change to inf2.8xlarge for more cores
+
+# Restrict SSH to your own IP for better security:
+# allowed_cidr_blocks = ["<your-public-ip>/32"]
+allowed_cidr_blocks = ["0.0.0.0/0"]
+
+# Use Spot to reduce cost ~70% (instance can be interrupted):
+# spot = true
+spot = false
+
+root_volume_size_gb = 200
+private_key_path    = "~/.ssh/lqcd-neuron.pem"
+key_name            = "lqcd-neuron-key"
+project_tag         = "lqcd-neuron"

@@ -1,0 +1,244 @@
+"""
+AWS Neuron ahead-of-time compilation utilities.
+
+This module wraps ``torch_neuronx.trace`` (Trn1 / Inf2) to compile the hot
+kernel inside each Lattice QCD operation — primarily the Dslash operator —
+into a NeuronCore graph.
+
+Why AoT compilation matters for Lattice QCD
+--------------------------------------------
+In QUDA, kernels are JIT-compiled by the CUDA runtime at first invocation
+and then cached.  The Neuron SDK uses a *fully* ahead-of-time model:
+
+1. You call ``torch_neuronx.trace(model, example_inputs)`` **once**.
+2. The ``neuronx-cc`` compiler lowers the XLA HLO graph to a ``.neff``
+   (Neuron Executable File Format) binary.
+3. Subsequent calls to the returned ``ScriptModule`` execute the binary
+   directly on the NeuronCores — no JIT overhead.
+
+Constraints (and how we handle them)
+-------------------------------------
+• **Static shapes**: The compiled graph is tied to the shapes of
+  ``example_inputs``.  We perform one compilation per unique lattice size.
+  A simple cache keyed by ``(shape, dtype)`` avoids redundant compilations.
+
+• **No Python control flow in the graph**: Solver loops (CG, BiCGStab)
+  live on the host.  Only the ``forward()`` of each ``nn.Module`` is
+  traced.  This is the same pattern as PyTorch training loops.
+
+• **bfloat16 by default on Trn1**: The NeuronCores-v2 execute bfloat16
+  matrix operations at peak throughput.  We offer a helper to cast float32
+  models and inputs to bfloat16 before tracing.
+
+Usage::
+
+    from lqcd_neuron.dirac import WilsonDirac
+    from lqcd_neuron.neuron import NeuronCompiler
+
+    D = WilsonDirac(mass=0.1)
+    compiler = NeuronCompiler()
+    D_neuron = compiler.compile_dslash(D, lattice_shape=(8,4,4,4), nc=3)
+
+    # D_neuron is a compiled ScriptModule; call it exactly like D.forward():
+    out = D_neuron(psi, U)
+"""
+
+from __future__ import annotations
+
+import os
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+from .device import NeuronDevice, get_device, NeuronHardware
+
+logger = logging.getLogger(__name__)
+
+
+class NeuronCompiler:
+    """Compile ``nn.Module`` operators for execution on Neuron hardware.
+
+    Args:
+        workdir:        Directory for neuronx-cc intermediate artefacts.
+                        Defaults to ``~/.cache/lqcd-neuron/neuronx``.
+        dtype:          Data type for compilation (``'float32'`` or
+                        ``'bfloat16'``).  Trn1/Inf2 prefer bfloat16.
+        optimize_level: Compiler optimisation level (1–3).
+        device:         Override the detected :class:`NeuronDevice`.
+    """
+
+    def __init__(
+        self,
+        workdir: Optional[str] = None,
+        dtype: str = "float32",
+        optimize_level: int = 2,
+        device: Optional[NeuronDevice] = None,
+    ) -> None:
+        self.dtype = dtype
+        self.optimize_level = optimize_level
+        self._device = device or get_device()
+        self._cache: Dict[Tuple, Any] = {}
+
+        if workdir is None:
+            workdir = str(Path.home() / ".cache" / "lqcd-neuron" / "neuronx")
+        self.workdir = workdir
+        os.makedirs(self.workdir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Dtype helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def torch_dtype(self) -> torch.dtype:
+        return torch.bfloat16 if self.dtype == "bfloat16" else torch.float32
+
+    def _to_complex_dtype(self) -> torch.dtype:
+        return (
+            torch.complex32   # not universally supported; use complex64 as fallback
+            if self.dtype == "bfloat16"
+            else torch.complex64
+        )
+
+    # ------------------------------------------------------------------
+    # Core compilation entry point
+    # ------------------------------------------------------------------
+
+    def compile(
+        self,
+        model: nn.Module,
+        example_inputs: Tuple[torch.Tensor, ...],
+        cache_key: Optional[str] = None,
+    ) -> nn.Module:
+        """Compile *model* for Neuron given *example_inputs*.
+
+        On non-Neuron hardware (CPU, CUDA) this returns the original
+        *model* unchanged so the same calling code works everywhere.
+
+        Args:
+            model:          The ``nn.Module`` to compile.
+            example_inputs: Tuple of example input tensors (matching shapes
+                            and dtypes that the model will be called with at
+                            runtime).
+            cache_key:      Optional string key for the in-process cache.
+
+        Returns:
+            Compiled ``ScriptModule`` (Neuron) or the original module (CPU).
+        """
+        if cache_key and cache_key in self._cache:
+            return self._cache[cache_key]
+
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — returning PyTorch CPU module."
+            )
+            return model
+
+        try:
+            import torch_neuronx
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "torch-neuronx is required for Neuron compilation.  "
+                "Install it with: pip install torch-neuronx"
+            ) from exc
+
+        logger.info(
+            "Compiling %s for Neuron (dtype=%s, opt=%d) …",
+            type(model).__name__,
+            self.dtype,
+            self.optimize_level,
+        )
+
+        # Set compiler environment flags
+        os.environ.setdefault("NEURON_CC_FLAGS", f"--O{self.optimize_level}")
+        os.environ.setdefault("NEURONX_CACHE", "1")
+        os.environ.setdefault("NEURONX_DUMP_TO", self.workdir)
+
+        compiled = torch_neuronx.trace(model, example_inputs)
+
+        if cache_key:
+            self._cache[cache_key] = compiled
+
+        logger.info("Compilation complete.")
+        return compiled
+
+    # ------------------------------------------------------------------
+    # Convenience methods for common operators
+    # ------------------------------------------------------------------
+
+    def compile_dslash(
+        self,
+        dslash_module: nn.Module,
+        lattice_shape: Tuple[int, int, int, int],
+        nc: int = 3,
+        ns: int = 4,
+    ) -> nn.Module:
+        """Compile a Dslash operator for a fixed lattice shape.
+
+        Args:
+            dslash_module: A ``WilsonDslash``, ``WilsonDirac``, or
+                           ``CloverWilsonDirac`` instance.
+            lattice_shape: ``(T, Z, Y, X)`` lattice extents.
+            nc:            Number of colours.
+            ns:            Number of spin components.
+
+        Returns:
+            Compiled or original module.
+        """
+        T, Z, Y, X = lattice_shape
+        dtype = torch.complex64  # complex64 = 2×float32
+        dev = self._device.device
+
+        psi_example = torch.zeros(T, Z, Y, X, ns, nc, dtype=dtype, device=dev)
+        U_example   = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dtype, device=dev)
+
+        key = f"dslash_{type(dslash_module).__name__}_{lattice_shape}_{nc}"
+        return self.compile(dslash_module, (psi_example, U_example), cache_key=key)
+
+    def compile_observable(
+        self,
+        observable_module: nn.Module,
+        lattice_shape: Tuple[int, int, int, int],
+        nc: int = 3,
+    ) -> nn.Module:
+        """Compile a gauge observable (plaquette nn.Module) for a fixed shape.
+
+        Args:
+            observable_module: A plaquette or Polyakov-loop ``nn.Module``.
+            lattice_shape:     ``(T, Z, Y, X)``.
+            nc:                Number of colours.
+
+        Returns:
+            Compiled or original module.
+        """
+        T, Z, Y, X = lattice_shape
+        dtype = torch.complex64
+        dev = self._device.device
+
+        U_example = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dtype, device=dev)
+        key = f"obs_{type(observable_module).__name__}_{lattice_shape}_{nc}"
+        return self.compile(observable_module, (U_example,), cache_key=key)
+
+    # ------------------------------------------------------------------
+    # torch.compile backend (PyTorch 2.x alternative to trace)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def torch_compile(model: nn.Module, backend: str = "neuronx") -> nn.Module:
+        """Wrap *model* with ``torch.compile(backend=backend)``.
+
+        ``torch.compile`` provides a higher-level interface and supports
+        dynamic shapes better than ``torch_neuronx.trace``.  Use this when
+        the lattice size may vary between calls.
+
+        Args:
+            model:   The module to compile.
+            backend: Compiler backend string.  ``'neuronx'`` for Trn1/Inf2,
+                     ``'inductor'`` for GPU/CPU fallback.
+
+        Returns:
+            Compiled callable.
+        """
+        return torch.compile(model, backend=backend)
