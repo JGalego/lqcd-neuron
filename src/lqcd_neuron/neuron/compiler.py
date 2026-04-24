@@ -152,7 +152,7 @@ class NeuronCompiler:
         )
 
         # Set compiler environment flags
-        os.environ.setdefault("NEURON_CC_FLAGS", f"--O{self.optimize_level}")
+        os.environ.setdefault("NEURON_CC_FLAGS", f"--optlevel {self.optimize_level}")
         os.environ.setdefault("NEURONX_CACHE", "1")
         os.environ.setdefault("NEURONX_DUMP_TO", self.workdir)
 
