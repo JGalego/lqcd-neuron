@@ -30,7 +30,7 @@ Direction mapping (μ → lattice dimension to roll):
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -178,3 +178,136 @@ class WilsonDirac(nn.Module):
     def normal(self, psi: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
         """Apply M†M (for use with CG on the normal equations)."""
         return self.dagger(self.forward(psi, U), U)
+
+
+# ---------------------------------------------------------------------------
+# Real-arithmetic adapters for AWS Neuron (NCC_EVRF004 workaround)
+# ---------------------------------------------------------------------------
+# neuronx-cc does not support complex dtypes.  These adapters accept the real
+# and imaginary parts of psi/U as separate float32 tensors, perform identical
+# arithmetic using only real ops, and return (result_re, result_im).
+# A _ComplexDslashWrapper in compiler.py splits/re-joins at the host boundary
+# so callers keep the standard complex64 interface.
+# ---------------------------------------------------------------------------
+
+class _NeuronWilsonDslashAdapter(nn.Module):
+    """Pure float32 Wilson hopping term for Neuron (NCC_EVRF004 workaround).
+
+    Inputs: ``(psi_re, psi_im, U_re, U_im)`` — float32 tensors.
+    Returns: ``(result_re, result_im)`` — float32 tensors.
+    """
+
+    def __init__(self, nc: int = 3) -> None:
+        super().__init__()
+        G  = degrand_rossi_gammas(dtype=torch.complex64)  # (4,4,4)
+        I4 = torch.eye(4, dtype=torch.complex64)
+        P_minus = torch.stack([I4 - G[mu] for mu in range(4)], dim=0)
+        P_plus  = torch.stack([I4 + G[mu] for mu in range(4)], dim=0)
+        self.register_buffer("P_minus_re", P_minus.real.float())
+        self.register_buffer("P_minus_im", P_minus.imag.float())
+        self.register_buffer("P_plus_re",  P_plus.real.float())
+        self.register_buffer("P_plus_im",  P_plus.imag.float())
+
+    @staticmethod
+    def _color_mv(
+        U_re: torch.Tensor, U_im: torch.Tensor,
+        v_re: torch.Tensor, v_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Complex colour matmul: U @ v for each spin component.
+
+        U: (..., Nc, Nc), v: (..., Ns, Nc) → (..., Ns, Nc).
+        Equiv: ``einsum("...ij,...sj->...si", U, v)`` but float32.
+        """
+        r_re = (torch.einsum("...ij,...sj->...si", U_re, v_re)
+                - torch.einsum("...ij,...sj->...si", U_im, v_im))
+        r_im = (torch.einsum("...ij,...sj->...si", U_re, v_im)
+                + torch.einsum("...ij,...sj->...si", U_im, v_re))
+        return r_re, r_im
+
+    @staticmethod
+    def _color_dag_mv(
+        U_re: torch.Tensor, U_im: torch.Tensor,
+        v_re: torch.Tensor, v_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Complex colour matmul: U† @ v for each spin component.
+
+        Equiv: ``einsum("...ji,...sj->...si", U.conj(), v)`` but float32.
+        (U†)[i,j] = conj(U[j,i]) = U_re[j,i] − i U_im[j,i].
+        """
+        r_re = (torch.einsum("...ji,...sj->...si", U_re, v_re)
+                + torch.einsum("...ji,...sj->...si", U_im, v_im))
+        r_im = (torch.einsum("...ji,...sj->...si", U_re, v_im)
+                - torch.einsum("...ji,...sj->...si", U_im, v_re))
+        return r_re, r_im
+
+    @staticmethod
+    def _spin_mv(
+        P_re: torch.Tensor, P_im: torch.Tensor,
+        v_re: torch.Tensor, v_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Complex spin-projector matmul: P @ v.
+
+        P_re/im: (4, 4) — spin; v_re/im: (..., 4, Nc) → (..., 4, Nc).
+        Equiv: ``einsum("ij,...jk->...ik", P, v)`` but float32.
+        """
+        r_re = (torch.einsum("ij,...jk->...ik", P_re, v_re)
+                - torch.einsum("ij,...jk->...ik", P_im, v_im))
+        r_im = (torch.einsum("ij,...jk->...ik", P_re, v_im)
+                + torch.einsum("ij,...jk->...ik", P_im, v_re))
+        return r_re, r_im
+
+    def forward(
+        self,
+        psi_re: torch.Tensor, psi_im: torch.Tensor,
+        U_re: torch.Tensor, U_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        result_re = torch.zeros_like(psi_re)
+        result_im = torch.zeros_like(psi_im)
+
+        for mu in range(4):
+            U_mu_re = U_re[..., mu, :, :]
+            U_mu_im = U_im[..., mu, :, :]
+
+            # Forward hop: − ½ (I−γ_μ) U(x,μ) ψ(x+μ̂)
+            pf_re = torch.roll(psi_re, -1, dims=mu)
+            pf_im = torch.roll(psi_im, -1, dims=mu)
+            Upf_re, Upf_im = self._color_mv(U_mu_re, U_mu_im, pf_re, pf_im)
+            cf_re, cf_im = self._spin_mv(
+                self.P_minus_re[mu], self.P_minus_im[mu], Upf_re, Upf_im
+            )
+
+            # Backward hop: − ½ (I+γ_μ) U†(x−μ̂,μ) ψ(x−μ̂)
+            pb_re = torch.roll(psi_re, 1, dims=mu)
+            pb_im = torch.roll(psi_im, 1, dims=mu)
+            Ub_re = torch.roll(U_mu_re, 1, dims=mu)
+            Ub_im = torch.roll(U_mu_im, 1, dims=mu)
+            Upb_re, Upb_im = self._color_dag_mv(Ub_re, Ub_im, pb_re, pb_im)
+            cb_re, cb_im = self._spin_mv(
+                self.P_plus_re[mu], self.P_plus_im[mu], Upb_re, Upb_im
+            )
+
+            result_re = result_re - 0.5 * (cf_re + cb_re)
+            result_im = result_im - 0.5 * (cf_im + cb_im)
+
+        return result_re, result_im
+
+
+class _NeuronWilsonDiracAdapter(nn.Module):
+    """Pure float32 Wilson Dirac operator M = (4+m)I + D_hop for Neuron.
+
+    Inputs: ``(psi_re, psi_im, U_re, U_im)`` — float32 tensors.
+    Returns: ``(result_re, result_im)`` — float32 tensors.
+    """
+
+    def __init__(self, mass: float = 0.1, nc: int = 3) -> None:
+        super().__init__()
+        self.diag = 4.0 + mass
+        self.hop  = _NeuronWilsonDslashAdapter(nc=nc)
+
+    def forward(
+        self,
+        psi_re: torch.Tensor, psi_im: torch.Tensor,
+        U_re: torch.Tensor, U_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hop_re, hop_im = self.hop(psi_re, psi_im, U_re, U_im)
+        return self.diag * psi_re + hop_re, self.diag * psi_im + hop_im

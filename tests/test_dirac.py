@@ -12,6 +12,10 @@ from lqcd_neuron.dirac import (
     sigma_munu,
 )
 from lqcd_neuron.dirac.clover import compute_clover, CloverWilsonDirac
+from lqcd_neuron.dirac.wilson import (
+    _NeuronWilsonDslashAdapter,
+    _NeuronWilsonDiracAdapter,
+)
 
 
 DTYPE = torch.complex64
@@ -191,3 +195,80 @@ class TestClover:
         D.set_gauge(U)
         out = D(psi, U)
         assert out.shape == psi.shape
+
+
+# ---------------------------------------------------------------------------
+# Real-arithmetic Neuron adapters (NCC_EVRF004 workaround)
+# ---------------------------------------------------------------------------
+
+class TestNeuronRealArithmetic:
+    """Verify that the pure-float32 Dslash/Dirac adapters match the complex
+    reference implementation to float32 precision."""
+
+    def test_dslash_adapter_matches_complex(self, geom, U, psi):
+        """_NeuronWilsonDslashAdapter should match WilsonDslash.forward."""
+        D_ref = WilsonDslash(nc=geom.nc, dtype=DTYPE)
+        ref   = D_ref(psi, U)
+
+        adapter = _NeuronWilsonDslashAdapter(nc=geom.nc)
+        r_re, r_im = adapter(
+            psi.real.contiguous(), psi.imag.contiguous(),
+            U.real.contiguous(),   U.imag.contiguous(),
+        )
+        result = torch.complex(r_re, r_im)
+
+        assert torch.allclose(result, ref, atol=ATOL), (
+            f"max abs diff = {(result - ref).abs().max().item():.2e}"
+        )
+
+    def test_dirac_adapter_matches_complex(self, geom, U, psi):
+        """_NeuronWilsonDiracAdapter should match WilsonDirac.forward."""
+        mass  = 0.1
+        D_ref = WilsonDirac(mass=mass, nc=geom.nc, dtype=DTYPE)
+        ref   = D_ref(psi, U)
+
+        adapter = _NeuronWilsonDiracAdapter(mass=mass, nc=geom.nc)
+        r_re, r_im = adapter(
+            psi.real.contiguous(), psi.imag.contiguous(),
+            U.real.contiguous(),   U.imag.contiguous(),
+        )
+        result = torch.complex(r_re, r_im)
+
+        assert torch.allclose(result, ref, atol=ATOL), (
+            f"max abs diff = {(result - ref).abs().max().item():.2e}"
+        )
+
+    def test_dslash_adapter_linearity(self, geom, U, psi, chi):
+        """Real adapter must satisfy linearity in the spinor argument."""
+        adapter = _NeuronWilsonDslashAdapter(nc=geom.nc)
+        a_re, a_im = 0.5, 0.3  # scalar α = 0.5 + 0.3i
+
+        # α·psi + chi (complex arithmetic on host before splitting)
+        apchi = (a_re + 1j * a_im) * psi + chi
+
+        def run(p):
+            r_re, r_im = adapter(
+                p.real.contiguous(), p.imag.contiguous(),
+                U.real.contiguous(),  U.imag.contiguous(),
+            )
+            return torch.complex(r_re, r_im)
+
+        lhs = run(apchi)
+        rhs = (a_re + 1j * a_im) * run(psi) + run(chi)
+        assert torch.allclose(lhs, rhs, atol=ATOL)
+
+    def test_cold_gauge_dslash_adapter(self, geom):
+        """On a cold gauge field both adapters should match their reference."""
+        U_cold = GaugeField.cold(geom, dtype=DTYPE).tensor
+        psi    = ColorSpinorField.gaussian(geom, seed=99, dtype=DTYPE).tensor
+
+        for nc in [geom.nc]:
+            D_ref = WilsonDslash(nc=nc, dtype=DTYPE)
+            ref   = D_ref(psi, U_cold)
+
+            adapter = _NeuronWilsonDslashAdapter(nc=nc)
+            r_re, r_im = adapter(
+                psi.real.contiguous(),    psi.imag.contiguous(),
+                U_cold.real.contiguous(), U_cold.imag.contiguous(),
+            )
+            assert torch.allclose(torch.complex(r_re, r_im), ref, atol=ATOL)

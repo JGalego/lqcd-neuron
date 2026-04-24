@@ -92,6 +92,27 @@ class _ComplexInputWrapper(nn.Module):
         return self._real_module(U.real.contiguous(), U.imag.contiguous())
 
 
+class _ComplexDslashWrapper(nn.Module):
+    """Host-side shim for the Dslash/Dirac real-arithmetic adapters.
+
+    Splits ``complex64`` spinor and gauge tensors into float32 re/im halves,
+    calls the compiled real-arithmetic kernel, and reassembles the result
+    as a ``complex64`` spinor — preserving the standard
+    ``forward(psi, U)`` interface expected by examples and solvers.
+    """
+
+    def __init__(self, real_module: nn.Module) -> None:
+        super().__init__()
+        self._real_module = real_module
+
+    def forward(self, psi: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
+        r_re, r_im = self._real_module(
+            psi.real.contiguous(), psi.imag.contiguous(),
+            U.real.contiguous(),   U.imag.contiguous(),
+        )
+        return torch.complex(r_re, r_im)
+
+
 class NeuronCompiler:
     """Compile ``nn.Module`` operators for execution on Neuron hardware.
 
@@ -209,27 +230,61 @@ class NeuronCompiler:
         nc: int = 3,
         ns: int = 4,
     ) -> nn.Module:
-        """Compile a Dslash operator for a fixed lattice shape.
+        """Compile a Dslash / Dirac operator for a fixed lattice shape.
+
+        Uses a pure float32 real-arithmetic adapter to work around the
+        ``neuronx-cc`` restriction on complex dtypes (NCC_EVRF004).  The
+        returned module preserves the standard ``forward(psi, U)`` interface
+        with ``complex64`` tensors; the re/im split happens transparently
+        inside a host-side wrapper.
+
+        On non-Neuron hardware the original *dslash_module* is returned
+        unchanged.
 
         Args:
-            dslash_module: A ``WilsonDslash``, ``WilsonDirac``, or
-                           ``CloverWilsonDirac`` instance.
+            dslash_module: A ``WilsonDslash`` or ``WilsonDirac`` instance.
             lattice_shape: ``(T, Z, Y, X)`` lattice extents.
             nc:            Number of colours.
             ns:            Number of spin components.
 
         Returns:
-            Compiled or original module.
+            Module with ``forward(psi, U)`` accepting ``complex64`` tensors.
         """
-        T, Z, Y, X = lattice_shape
-        dtype = torch.complex64  # complex64 = 2×float32
-        dev = self._device.device
+        from ..dirac.wilson import (
+            WilsonDirac,
+            WilsonDslash,
+            _NeuronWilsonDiracAdapter,
+            _NeuronWilsonDslashAdapter,
+        )
 
-        psi_example = torch.zeros(T, Z, Y, X, ns, nc, dtype=dtype, device=dev)
-        U_example   = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dtype, device=dev)
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — returning PyTorch CPU module."
+            )
+            return dslash_module
+
+        if isinstance(dslash_module, WilsonDirac):
+            adapter: nn.Module = _NeuronWilsonDiracAdapter(
+                mass=dslash_module.mass, nc=nc
+            )
+        elif isinstance(dslash_module, WilsonDslash):
+            adapter = _NeuronWilsonDslashAdapter(nc=nc)
+        else:
+            raise TypeError(
+                f"compile_dslash: unsupported module type {type(dslash_module).__name__}. "
+                "Only WilsonDslash and WilsonDirac are currently supported."
+            )
+
+        T, Z, Y, X = lattice_shape
+        dev = self._device.device
+        psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=torch.float32, device=dev)
+        psi_im = torch.zeros_like(psi_re)
+        U_re   = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=dev)
+        U_im   = torch.zeros_like(U_re)
 
         key = f"dslash_{type(dslash_module).__name__}_{lattice_shape}_{nc}"
-        return self.compile(dslash_module, (psi_example, U_example), cache_key=key)
+        compiled = self.compile(adapter, (psi_re, psi_im, U_re, U_im), cache_key=key)
+        return _ComplexDslashWrapper(compiled)
 
     def compile_observable(
         self,
