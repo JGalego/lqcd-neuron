@@ -291,10 +291,15 @@ class NeuronCompiler:
             )
 
         T, Z, Y, X = lattice_shape
-        dev = self._device.device
-        psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=torch.float32, device=dev)
+        # torch_neuronx.trace requires CPU tensors as example inputs regardless
+        # of whether torch_xla is installed.  Using xm.xla_device() inputs would
+        # put the traced model into XLA lazy-execution mode, so computations are
+        # enqueued but never flushed to NeuronCores without an explicit
+        # xm.mark_step() call — the root cause of 0% neuron-top utilisation.
+        cpu = torch.device("cpu")
+        psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=torch.float32, device=cpu)
         psi_im = torch.zeros_like(psi_re)
-        U_re   = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=dev)
+        U_re   = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=cpu)
         U_im   = torch.zeros_like(U_re)
 
         key = f"dslash_{type(dslash_module).__name__}_{lattice_shape}_{nc}"
@@ -321,10 +326,11 @@ class NeuronCompiler:
         # float32 tensors, matching the pattern used by compile_dslash and
         # compile_plaquette.  Callers that need a complex-input interface should
         # use compile_plaquette (which wraps _ComplexInputWrapper) instead.
+        # See compile_dslash: example inputs must be CPU tensors for torch_neuronx.trace.
         T, Z, Y, X = lattice_shape
-        dev = self._device.device
+        cpu = torch.device("cpu")
 
-        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=dev)
+        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=cpu)
         U_im = torch.zeros_like(U_re)
         key = f"obs_{type(observable_module).__name__}_{lattice_shape}_{nc}"
         return self.compile(observable_module, (U_re, U_im), cache_key=key)
@@ -353,7 +359,6 @@ class NeuronCompiler:
             as a real scalar tensor.
         """
         T, Z, Y, X = lattice_shape
-        dev = self._device.device
         adapter = _NeuronPlaquetteAdapter(nc)
 
         if not self._device.is_neuron:
@@ -362,7 +367,9 @@ class NeuronCompiler:
             )
             return _ComplexInputWrapper(adapter)
 
-        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=dev)
+        # See compile_dslash: example inputs must be CPU tensors for torch_neuronx.trace.
+        cpu = torch.device("cpu")
+        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=cpu)
         U_im = torch.zeros_like(U_re)
         key = f"plaquette_{lattice_shape}_{nc}"
         compiled = self.compile(adapter, (U_re, U_im), cache_key=key)
