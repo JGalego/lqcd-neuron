@@ -159,11 +159,8 @@ class NeuronCompiler:
         return torch.bfloat16 if self.dtype == "bfloat16" else torch.float32
 
     def _to_complex_dtype(self) -> torch.dtype:
-        return (
-            torch.complex32   # not universally supported; use complex64 as fallback
-            if self.dtype == "bfloat16"
-            else torch.complex64
-        )
+        # torch.complex32 does not exist in PyTorch; always use complex64.
+        return torch.complex64
 
     # ------------------------------------------------------------------
     # Core compilation entry point
@@ -320,13 +317,17 @@ class NeuronCompiler:
         Returns:
             Compiled or original module.
         """
+        # neuronx-cc rejects complex dtypes (NCC_EVRF004).  Split into real/imag
+        # float32 tensors, matching the pattern used by compile_dslash and
+        # compile_plaquette.  Callers that need a complex-input interface should
+        # use compile_plaquette (which wraps _ComplexInputWrapper) instead.
         T, Z, Y, X = lattice_shape
-        dtype = torch.complex64
         dev = self._device.device
 
-        U_example = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dtype, device=dev)
+        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=dev)
+        U_im = torch.zeros_like(U_re)
         key = f"obs_{type(observable_module).__name__}_{lattice_shape}_{nc}"
-        return self.compile(observable_module, (U_example,), cache_key=key)
+        return self.compile(observable_module, (U_re, U_im), cache_key=key)
 
     def compile_plaquette(
         self,

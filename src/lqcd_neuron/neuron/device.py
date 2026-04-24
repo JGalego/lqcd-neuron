@@ -29,6 +29,7 @@ XLA backend).
 
 from __future__ import annotations
 
+import glob
 import os
 from enum import Enum, auto
 from typing import Optional
@@ -47,9 +48,8 @@ class NeuronHardware(Enum):
 
 def _detect_hardware() -> NeuronHardware:
     """Attempt to detect the Neuron hardware generation from the environment."""
-    # ``NEURON_RT_NUM_CORES`` is set by the Neuron runtime on Trainium/Inferentia
-    # instances.  The instance type is available via the EC2 metadata service or
-    # the ``AWS_DEFAULT_REGION`` + instance-type combination.
+    # ``INSTANCE_TYPE`` can be set manually, but it is NOT set automatically by
+    # the Neuron runtime or by AWS.  It is kept here as a user-provided hint.
     instance_type = os.environ.get("INSTANCE_TYPE", "").lower()
     if "trn1" in instance_type:
         return NeuronHardware.TRN1
@@ -71,6 +71,17 @@ def _detect_hardware() -> NeuronHardware:
         return NeuronHardware.INF1
     except ImportError:
         pass
+
+    # Last resort: check for Neuron character device nodes.  The Linux kernel
+    # driver exposes /dev/neuron0, /dev/neuron1, … on every Inf/Trn instance
+    # regardless of whether the Python packages are installed in the active
+    # virtual environment.  Returning UNKNOWN (not NONE) ensures that
+    # ``is_neuron_available()`` returns True and that ``NeuronCompiler.compile``
+    # raises a clear ImportError ("pip install torch-neuronx") rather than
+    # silently falling back to CPU — which is what causes neuron-top to show
+    # 0 % utilisation when the Neuron venv is not activated.
+    if glob.glob("/dev/neuron*"):
+        return NeuronHardware.UNKNOWN
 
     return NeuronHardware.NONE
 
