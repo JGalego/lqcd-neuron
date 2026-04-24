@@ -146,6 +146,14 @@ class NeuronCompiler:
     # Dtype helpers
     # ------------------------------------------------------------------
 
+    def _disk_cache_path(self, cache_key: Optional[str]) -> Optional[Path]:
+        """Return the .pt path for *cache_key*, or None if key is falsy."""
+        if not cache_key:
+            return None
+        # Sanitise key so it is safe as a filename
+        safe = cache_key.replace(" ", "_").replace("(", "").replace(")", "").replace(",", "-")
+        return Path(self.workdir) / f"{safe}.pt"
+
     @property
     def torch_dtype(self) -> torch.dtype:
         return torch.bfloat16 if self.dtype == "bfloat16" else torch.float32
@@ -185,6 +193,15 @@ class NeuronCompiler:
         if cache_key and cache_key in self._cache:
             return self._cache[cache_key]
 
+        # Check persistent on-disk cache first
+        disk_path = self._disk_cache_path(cache_key) if cache_key else None
+        if disk_path and disk_path.exists():
+            logger.info("Loading cached Neuron module from %s", disk_path)
+            compiled = torch.jit.load(str(disk_path))
+            if cache_key:
+                self._cache[cache_key] = compiled
+            return compiled
+
         if not self._device.is_neuron:
             logger.info(
                 "No Neuron hardware detected — returning PyTorch CPU module."
@@ -208,13 +225,14 @@ class NeuronCompiler:
 
         # Set compiler environment flags
         os.environ.setdefault("NEURON_CC_FLAGS", f"--optlevel {self.optimize_level}")
-        os.environ.setdefault("NEURONX_CACHE", "1")
-        os.environ.setdefault("NEURONX_DUMP_TO", self.workdir)
 
         compiled = torch_neuronx.trace(model, example_inputs)
 
         if cache_key:
             self._cache[cache_key] = compiled
+            if disk_path:
+                torch.jit.save(compiled, str(disk_path))
+                logger.info("Cached compiled module to %s", disk_path)
 
         logger.info("Compilation complete.")
         return compiled
