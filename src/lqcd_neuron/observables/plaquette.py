@@ -59,6 +59,58 @@ def plaquette_tensor(U: torch.Tensor) -> torch.Tensor:
     return torch.stack(results, dim=-1)  # (T,Z,Y,X, 6)
 
 
+def plaquette_tensor_real(
+    U_re: torch.Tensor, U_im: torch.Tensor
+) -> torch.Tensor:
+    """Compute Re Tr of each elementary plaquette using pure real arithmetic.
+
+    Equivalent to :func:`plaquette_tensor` but decomposes the SU(N) link
+    matrices into real and imaginary parts so that no complex dtype appears
+    in the computation graph.  Required for backends that do not support
+    complex data types (e.g. AWS Neuron / ``neuronx-cc``).
+
+    The identity used throughout is the real-part-of-trace shortcut: for the
+    final matrix product ``C = B @ U_ν†`` we only compute ``C_re`` because
+    ``Re Tr[C] = Tr[C_re]``.
+
+    Args:
+        U_re: Real part of the gauge field, shape ``(T, Z, Y, X, 4, Nc, Nc)``,
+              dtype ``float32``.
+        U_im: Imaginary part, same shape and dtype as *U_re*.
+
+    Returns:
+        Float tensor of shape ``(T, Z, Y, X, 6)`` — identical semantics to
+        :func:`plaquette_tensor`.
+    """
+    _PAIRS = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    results = []
+    for mu, nu in _PAIRS:
+        Umr = U_re[..., mu, :, :];     Umi = U_im[..., mu, :, :]
+        Unr = U_re[..., nu, :, :];     Uni = U_im[..., nu, :, :]
+        Umr_xpnu = torch.roll(Umr, -1, dims=nu)
+        Umi_xpnu = torch.roll(Umi, -1, dims=nu)
+        Unr_xpmu = torch.roll(Unr, -1, dims=mu)
+        Uni_xpmu = torch.roll(Uni, -1, dims=mu)
+
+        # A = U_mu @ U_nu_xpmu  (regular complex matmul in real arithmetic)
+        Ar = Umr @ Unr_xpmu - Umi @ Uni_xpmu
+        Ai = Umr @ Uni_xpmu + Umi @ Unr_xpmu
+
+        # B = A @ U_mu_xpnu†  (B[i,k] = sum_j A[i,j] * conj(U_mu_xpnu[k,j]))
+        Ut_r = Umr_xpnu.transpose(-2, -1)
+        Ut_i = Umi_xpnu.transpose(-2, -1)
+        Br = Ar @ Ut_r + Ai @ Ut_i
+        Bi = Ai @ Ut_r - Ar @ Ut_i
+
+        # C_re only: C = B @ U_nu†  — Re Tr[C] = Tr[C_re]
+        Cr = Br @ Unr.transpose(-2, -1) + Bi @ Uni.transpose(-2, -1)
+
+        retr = torch.diagonal(Cr, dim1=-2, dim2=-1).sum(dim=-1)
+        results.append(retr)
+
+    return torch.stack(results, dim=-1)  # (T,Z,Y,X, 6)
+
+
 def plaquette(U_or_field) -> float:
     """Compute the average plaquette  P ∈ [0, 1].
 

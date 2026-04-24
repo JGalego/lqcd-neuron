@@ -80,8 +80,7 @@ def main() -> None:
     if is_neuron_available():
         print("\nNeuron hardware detected — compiling PlaquetteModule …")
         compiler = NeuronCompiler(dtype="bfloat16")
-        plaq_mod = PlaquetteModule()
-        plaq_neuron = compiler.compile_observable(plaq_mod, geom.shape)
+        plaq_neuron = compiler.compile_plaquette(geom.shape)
         P_neuron = plaq_neuron(U_hot.tensor).item()
         print(f"Neuron plaquette (hot): {P_neuron:.6f}")
     else:

@@ -58,6 +58,40 @@ from .device import NeuronDevice, get_device, NeuronHardware
 logger = logging.getLogger(__name__)
 
 
+class _NeuronPlaquetteAdapter(nn.Module):
+    """Pure float32 plaquette kernel for Neuron.
+
+    Accepts the gauge field as two real tensors (real and imaginary parts)
+    and computes the average plaquette using
+    :func:`~lqcd_neuron.observables.plaquette.plaquette_tensor_real`.
+    This avoids the ``complex64`` dtype that ``neuronx-cc`` does not support.
+    """
+
+    def __init__(self, nc: int) -> None:
+        super().__init__()
+        self.nc = nc
+
+    def forward(self, U_re: torch.Tensor, U_im: torch.Tensor) -> torch.Tensor:
+        from ..observables.plaquette import plaquette_tensor_real
+
+        return plaquette_tensor_real(U_re, U_im).mean() / self.nc
+
+
+class _ComplexInputWrapper(nn.Module):
+    """Host-side shim that splits a complex gauge tensor into real/imag parts.
+
+    Wraps a compiled Neuron module that expects ``(U_re, U_im)`` so that
+    callers can still pass a standard ``complex64`` gauge tensor.
+    """
+
+    def __init__(self, real_module: nn.Module) -> None:
+        super().__init__()
+        self._real_module = real_module
+
+    def forward(self, U: torch.Tensor) -> torch.Tensor:
+        return self._real_module(U.real.contiguous(), U.imag.contiguous())
+
+
 class NeuronCompiler:
     """Compile ``nn.Module`` operators for execution on Neuron hardware.
 
@@ -220,6 +254,45 @@ class NeuronCompiler:
         U_example = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dtype, device=dev)
         key = f"obs_{type(observable_module).__name__}_{lattice_shape}_{nc}"
         return self.compile(observable_module, (U_example,), cache_key=key)
+
+    def compile_plaquette(
+        self,
+        lattice_shape: Tuple[int, int, int, int],
+        nc: int = 3,
+    ) -> nn.Module:
+        """Compile the plaquette observable for Neuron hardware.
+
+        Unlike :meth:`compile_observable`, this method uses a real-arithmetic
+        implementation (:class:`_NeuronPlaquetteAdapter`) to avoid the
+        ``complex64`` dtype restriction of ``neuronx-cc`` (NCC_EVRF004).
+
+        On non-Neuron hardware the method returns a CPU-compatible wrapper
+        with the same interface so calling code works unchanged everywhere.
+
+        Args:
+            lattice_shape: ``(T, Z, Y, X)`` lattice extents.
+            nc:            Number of colours.
+
+        Returns:
+            Module that accepts a ``complex64`` gauge tensor of shape
+            ``(T, Z, Y, X, 4, Nc, Nc)`` and returns the average plaquette
+            as a real scalar tensor.
+        """
+        T, Z, Y, X = lattice_shape
+        dev = self._device.device
+        adapter = _NeuronPlaquetteAdapter(nc)
+
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — returning CPU plaquette module."
+            )
+            return _ComplexInputWrapper(adapter)
+
+        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=dev)
+        U_im = torch.zeros_like(U_re)
+        key = f"plaquette_{lattice_shape}_{nc}"
+        compiled = self.compile(adapter, (U_re, U_im), cache_key=key)
+        return _ComplexInputWrapper(compiled)
 
     # ------------------------------------------------------------------
     # torch.compile backend (PyTorch 2.x alternative to trace)
