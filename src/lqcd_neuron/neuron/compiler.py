@@ -84,33 +84,40 @@ class _ComplexInputWrapper(nn.Module):
     callers can still pass a standard ``complex64`` gauge tensor.
     """
 
-    def __init__(self, real_module: nn.Module) -> None:
+    def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
         super().__init__()
         self._real_module = real_module
+        self._compute_dtype = compute_dtype
 
     def forward(self, U: torch.Tensor) -> torch.Tensor:
-        return self._real_module(U.real.contiguous(), U.imag.contiguous())
+        dt = self._compute_dtype
+        return self._real_module(
+            U.real.to(dt).contiguous(),
+            U.imag.to(dt).contiguous(),
+        )
 
 
 class _ComplexDslashWrapper(nn.Module):
     """Host-side shim for the Dslash/Dirac real-arithmetic adapters.
 
-    Splits ``complex64`` spinor and gauge tensors into float32 re/im halves,
-    calls the compiled real-arithmetic kernel, and reassembles the result
-    as a ``complex64`` spinor — preserving the standard
+    Splits ``complex64`` spinor and gauge tensors into real/imag halves,
+    casts to the compute dtype used by the compiled kernel, and reassembles
+    the result as a ``complex64`` spinor — preserving the standard
     ``forward(psi, U)`` interface expected by examples and solvers.
     """
 
-    def __init__(self, real_module: nn.Module) -> None:
+    def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
         super().__init__()
         self._real_module = real_module
+        self._compute_dtype = compute_dtype
 
     def forward(self, psi: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
+        dt = self._compute_dtype
         r_re, r_im = self._real_module(
-            psi.real.contiguous(), psi.imag.contiguous(),
-            U.real.contiguous(),   U.imag.contiguous(),
+            psi.real.to(dt).contiguous(), psi.imag.to(dt).contiguous(),
+            U.real.to(dt).contiguous(),   U.imag.to(dt).contiguous(),
         )
-        return torch.complex(r_re, r_im)
+        return torch.complex(r_re.float(), r_im.float())
 
 
 class NeuronCompiler:
@@ -291,20 +298,22 @@ class NeuronCompiler:
             )
 
         T, Z, Y, X = lattice_shape
+        dt = self.torch_dtype
         # torch_neuronx.trace requires CPU tensors as example inputs regardless
         # of whether torch_xla is installed.  Using xm.xla_device() inputs would
         # put the traced model into XLA lazy-execution mode, so computations are
         # enqueued but never flushed to NeuronCores without an explicit
         # xm.mark_step() call — the root cause of 0% neuron-top utilisation.
         cpu = torch.device("cpu")
-        psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=torch.float32, device=cpu)
+        adapter = adapter.to(dt)
+        psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
         psi_im = torch.zeros_like(psi_re)
-        U_re   = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=cpu)
+        U_re   = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dt, device=cpu)
         U_im   = torch.zeros_like(U_re)
 
-        key = f"dslash_{type(dslash_module).__name__}_{lattice_shape}_{nc}"
+        key = f"dslash_{type(dslash_module).__name__}_{lattice_shape}_{nc}_{dt}"
         compiled = self.compile(adapter, (psi_re, psi_im, U_re, U_im), cache_key=key)
-        return _ComplexDslashWrapper(compiled)
+        return _ComplexDslashWrapper(compiled, compute_dtype=dt)
 
     def compile_observable(
         self,
@@ -328,11 +337,13 @@ class NeuronCompiler:
         # use compile_plaquette (which wraps _ComplexInputWrapper) instead.
         # See compile_dslash: example inputs must be CPU tensors for torch_neuronx.trace.
         T, Z, Y, X = lattice_shape
+        dt = self.torch_dtype
         cpu = torch.device("cpu")
 
-        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=cpu)
+        observable_module = observable_module.to(dt)
+        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dt, device=cpu)
         U_im = torch.zeros_like(U_re)
-        key = f"obs_{type(observable_module).__name__}_{lattice_shape}_{nc}"
+        key = f"obs_{type(observable_module).__name__}_{lattice_shape}_{nc}_{dt}"
         return self.compile(observable_module, (U_re, U_im), cache_key=key)
 
     def compile_plaquette(
@@ -359,21 +370,22 @@ class NeuronCompiler:
             as a real scalar tensor.
         """
         T, Z, Y, X = lattice_shape
-        adapter = _NeuronPlaquetteAdapter(nc)
+        dt = self.torch_dtype
+        adapter = _NeuronPlaquetteAdapter(nc).to(dt)
 
         if not self._device.is_neuron:
             logger.info(
                 "No Neuron hardware detected — returning CPU plaquette module."
             )
-            return _ComplexInputWrapper(adapter)
+            return _ComplexInputWrapper(adapter, compute_dtype=dt)
 
         # See compile_dslash: example inputs must be CPU tensors for torch_neuronx.trace.
         cpu = torch.device("cpu")
-        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=torch.float32, device=cpu)
+        U_re = torch.zeros(T, Z, Y, X, 4, nc, nc, dtype=dt, device=cpu)
         U_im = torch.zeros_like(U_re)
-        key = f"plaquette_{lattice_shape}_{nc}"
+        key = f"plaquette_{lattice_shape}_{nc}_{dt}"
         compiled = self.compile(adapter, (U_re, U_im), cache_key=key)
-        return _ComplexInputWrapper(compiled)
+        return _ComplexInputWrapper(compiled, compute_dtype=dt)
 
     # ------------------------------------------------------------------
     # torch.compile backend (PyTorch 2.x alternative to trace)

@@ -40,6 +40,8 @@ LATTICE_SIZES: List[Tuple[int, int, int, int]] = [
     (8, 8, 4, 4),
     (8, 8, 8, 4),
     (16, 8, 8, 8),
+    (16, 16, 16, 16),
+    (32, 16, 16, 16),
 ]
 
 WARMUP_ITERS = 5
