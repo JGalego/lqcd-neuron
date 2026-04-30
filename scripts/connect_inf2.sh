@@ -56,12 +56,15 @@ if [[ "${LOCAL}" -eq 1 ]]; then
         bash "${REPO_ROOT}/scripts/setup_inf2.sh" --local
     fi
 
-    BENCH_FLAG=""
-    [[ "${RUN_BENCH}" -eq 1 ]] && BENCH_FLAG="--bench"
-
-    if [[ "${RUN_TESTS}" -eq 1 ]]; then
+    if [[ "${RUN_TESTS}" -eq 1 && "${RUN_BENCH}" -eq 1 ]]; then
+        echo "[connect] Running test suite + benchmark locally …"
+        bash "${REPO_ROOT}/scripts/run_tests.sh" --test --bench
+    elif [[ "${RUN_TESTS}" -eq 1 ]]; then
         echo "[connect] Running test suite locally …"
-        bash "${REPO_ROOT}/scripts/run_tests.sh" ${BENCH_FLAG}
+        bash "${REPO_ROOT}/scripts/run_tests.sh" --test
+    elif [[ "${RUN_BENCH}" -eq 1 ]]; then
+        echo "[connect] Running benchmark locally …"
+        bash "${REPO_ROOT}/scripts/run_tests.sh" --bench
     elif [[ "${RUN_SETUP}" -eq 0 ]]; then
         echo "[connect] Nothing to do locally. Use --setup, --test, or --bench."
         echo "          (--local opens no interactive shell)"
@@ -140,15 +143,25 @@ fi
 # 6. Tests (optional)
 # ---------------------------------------------------------------------------
 if [[ "${RUN_TESTS}" -eq 1 ]]; then
-    BENCH_FLAG=""
-    [[ "${RUN_BENCH}" -eq 1 ]] && BENCH_FLAG="--bench --neuron"
-
     echo "[connect] Running test suite on the instance …"
     $SSH <<REMOTE
 set -euo pipefail
 cd ~/lqcd-neuron && git pull
 [[ -d "${DLAMI_VENV}" ]] && source "${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
-bash scripts/run_tests.sh ${BENCH_FLAG}
+bash scripts/run_tests.sh --test
+REMOTE
+fi
+
+# ---------------------------------------------------------------------------
+# 6b. Benchmarks (optional, independent of tests)
+# ---------------------------------------------------------------------------
+if [[ "${RUN_BENCH}" -eq 1 ]]; then
+    echo "[connect] Running benchmark on the instance …"
+    $SSH <<REMOTE
+set -euo pipefail
+cd ~/lqcd-neuron
+[[ -d "${DLAMI_VENV}" ]] && source "${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
+bash scripts/run_tests.sh --bench --neuron
 REMOTE
 fi
 

@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # scripts/run_tests.sh
 #
-# Runs the full test suite and (optionally) the benchmarks on a Neuron instance.
+# Runs the test suite and/or benchmarks.
 #
 # Usage:
-#   bash scripts/run_tests.sh                   # pytest only
-#   bash scripts/run_tests.sh --bench           # pytest + CPU benchmarks
-#   bash scripts/run_tests.sh --bench --neuron  # pytest + Neuron benchmarks
+#   bash scripts/run_tests.sh                   # tests only (default)
+#   bash scripts/run_tests.sh --test            # tests only
+#   bash scripts/run_tests.sh --bench           # CPU benchmark only
+#   bash scripts/run_tests.sh --bench --neuron  # Neuron benchmark only
+#   bash scripts/run_tests.sh --test --bench    # tests then CPU benchmark
+#   bash scripts/run_tests.sh --test --bench --neuron  # tests then Neuron benchmark
 #
 # Exit codes:
-#   0 — all tests passed (and benchmarks completed without error)
-#   1 — one or more tests failed
+#   0 — all requested steps completed without error
+#   1 — one or more steps failed
 #
 # Environment variables:
 #   LQCD_PYTEST_OPTS   -- extra options forwarded to pytest (e.g. "-x -q")
@@ -27,16 +30,23 @@ if [[ -z "${VIRTUAL_ENV:-}" && -f "${REPO_ROOT}/.venv/bin/activate" ]]; then
     source "${REPO_ROOT}/.venv/bin/activate"
 fi
 
+RUN_TEST=0
 RUN_BENCH=0
 USE_NEURON=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --bench)  RUN_BENCH=1;  shift ;;
+        --test)   RUN_TEST=1;  shift ;;
+        --bench)  RUN_BENCH=1; shift ;;
         --neuron) USE_NEURON=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Default: run tests when no step is explicitly requested
+if [[ "${RUN_TEST}" -eq 0 && "${RUN_BENCH}" -eq 0 ]]; then
+    RUN_TEST=1
+fi
 
 PYTEST_OPTS="${LQCD_PYTEST_OPTS:--v}"
 
@@ -69,25 +79,24 @@ EOF
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3. Run pytest
+# 3. Run pytest + smoke tests
 # ---------------------------------------------------------------------------
-echo "=== Unit Tests ==="
-# shellcheck disable=SC2086
-pytest tests/ ${PYTEST_OPTS}
-echo ""
-
-# ---------------------------------------------------------------------------
-# 4. Run examples as smoke tests
-# ---------------------------------------------------------------------------
-echo "=== Example Smoke Tests ==="
-for script in examples/01_plaquette.py examples/02_wilson_dslash.py examples/03_cg_inversion.py; do
-    echo "--- ${script} ---"
-    python3 "${script}"
+if [[ "${RUN_TEST}" -eq 1 ]]; then
+    echo "=== Unit Tests ==="
+    # shellcheck disable=SC2086
+    pytest tests/ ${PYTEST_OPTS}
     echo ""
-done
+
+    echo "=== Example Smoke Tests ==="
+    for script in examples/01_plaquette.py examples/02_wilson_dslash.py examples/03_cg_inversion.py; do
+        echo "--- ${script} ---"
+        python3 "${script}"
+        echo ""
+    done
+fi
 
 # ---------------------------------------------------------------------------
-# 5. Benchmarks (optional)
+# 4. Benchmarks
 # ---------------------------------------------------------------------------
 if [[ "${RUN_BENCH}" -eq 1 ]]; then
     echo "=== Dslash Throughput Benchmark ==="
