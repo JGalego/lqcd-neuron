@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # scripts/setup_inf2.sh
 #
-# One-shot bootstrap for an Inf2 / Trn1 instance.
+# Bootstrap for an Inf2 / Trn1 instance, or a local development machine.
 #
 # Usage:
-#   bash scripts/setup_inf2.sh [--repo-url <git-url>] [--branch <branch>]
+#   bash scripts/setup_inf2.sh                             # remote Inf2/Trn1
+#   bash scripts/setup_inf2.sh --local                     # local dev machine
+#   bash scripts/setup_inf2.sh [--repo-url <url>] [--branch <branch>]
 #
 # What it does:
 #   1. Activates the DLAMI Neuron virtualenv (or creates a fresh uv venv
 #      on non-DLAMI Ubuntu / Amazon Linux 2023 instances).
-#   2. Clones / updates the lqcd-neuron repository.
+#   2. Clones / updates the lqcd-neuron repository (skipped with --local).
 #   3. Installs the package with the [neuron] extras.
 #   4. Exports INSTANCE_TYPE so the hardware-detection heuristic works.
 #   5. Prints a quick sanity-check.
@@ -24,12 +26,15 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
+
 # ---------------------------------------------------------------------------
 # Defaults (override via CLI flags)
 # ---------------------------------------------------------------------------
 REPO_URL="${LQCD_NEURON_REPO_URL:-https://github.com/JGalego/lqcd-neuron}"
 BRANCH="${LQCD_NEURON_BRANCH:-main}"
 INSTALL_DIR="${HOME}/lqcd-neuron"
+LOCAL=0
 
 # DLAMI ships a ready-made Neuron virtualenv; fall back to uv otherwise.
 DLAMI_VENV="/opt/aws_neuronx_venv_pytorch_2_8"
@@ -39,12 +44,18 @@ DLAMI_VENV="/opt/aws_neuronx_venv_pytorch_2_8"
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --repo-url) REPO_URL="$2"; shift 2 ;;
-        --branch)   BRANCH="$2";   shift 2 ;;
+        --repo-url)    REPO_URL="$2";    shift 2 ;;
+        --branch)      BRANCH="$2";      shift 2 ;;
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+        --local)       LOCAL=1;          shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# In local mode, install in-place inside the repository checkout.
+if [[ "${LOCAL}" -eq 1 ]]; then
+    INSTALL_DIR="${REPO_ROOT}"
+fi
 
 log() { echo "[setup] $*"; }
 
@@ -71,7 +82,9 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2: Clone / update repository
 # ---------------------------------------------------------------------------
-if [[ -d "${INSTALL_DIR}/.git" ]]; then
+if [[ "${LOCAL}" -eq 1 ]]; then
+    log "Local mode — skipping clone, using repo at ${INSTALL_DIR}"
+elif [[ -d "${INSTALL_DIR}/.git" ]]; then
     log "Updating existing repo at ${INSTALL_DIR}"
     git -C "${INSTALL_DIR}" fetch origin
     git -C "${INSTALL_DIR}" checkout "${BRANCH}"

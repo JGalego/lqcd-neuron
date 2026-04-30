@@ -21,6 +21,10 @@ install: venv  ## Install the package + dev dependencies
 install-neuron: venv  ## Install the package + Neuron extras
 	$(UV) pip install -e ".[neuron,dev]"
 
+.PHONY: setup-local
+setup-local:  ## Set up a local dev environment (creates .venv, installs package)
+	bash scripts/setup_inf2.sh --local
+
 .PHONY: setup-inf2
 setup-inf2:  ## Bootstrap a fresh Inf2 / Trn1 instance
 	bash scripts/setup_inf2.sh
@@ -124,14 +128,14 @@ connect-setup:  ## Bootstrap the instance, then open a shell
 	bash scripts/connect_inf2.sh --setup
 
 .PHONY: connect-test
-connect-test:  ## Bootstrap + run tests on the instance
+connect-test:  ## Run tests on the instance
 	chmod +x scripts/connect_inf2.sh
-	bash scripts/connect_inf2.sh --setup --test
+	bash scripts/connect_inf2.sh --test
 
 .PHONY: connect-bench
-connect-bench:  ## Bootstrap + run benchmarks on the instance
+connect-bench:  ## Run benchmarks on the instance
 	chmod +x scripts/connect_inf2.sh
-	bash scripts/connect_inf2.sh --setup --test --bench
+	bash scripts/connect_inf2.sh --bench
 
 .PHONY: tfvars
 tvars:  ## Copy the example tfvars file (edit before running tofu-apply)

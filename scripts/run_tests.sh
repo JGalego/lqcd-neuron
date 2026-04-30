@@ -18,8 +18,14 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
 cd "${REPO_ROOT}"
+
+# Auto-activate the project venv when not already inside one.
+if [[ -z "${VIRTUAL_ENV:-}" && -f "${REPO_ROOT}/.venv/bin/activate" ]]; then
+    # shellcheck disable=SC1090
+    source "${REPO_ROOT}/.venv/bin/activate"
+fi
 
 RUN_BENCH=0
 USE_NEURON=0

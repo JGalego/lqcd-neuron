@@ -2,7 +2,8 @@
 # scripts/connect_inf2.sh
 #
 # Connect to the Inf2 instance provisioned by OpenTofu, optionally running
-# the bootstrap and test scripts remotely.
+# the bootstrap and test scripts remotely.  Pass --local to run everything
+# on this machine instead (no SSH, no OpenTofu required).
 #
 # Usage:
 #   bash scripts/connect_inf2.sh                       # interactive SSH shell
@@ -10,8 +11,12 @@
 #   bash scripts/connect_inf2.sh --setup --test        # bootstrap + run tests
 #   bash scripts/connect_inf2.sh --setup --bench       # bootstrap + full benchmark
 #   bash scripts/connect_inf2.sh --ssm                 # connect via SSM (no port 22)
+#   bash scripts/connect_inf2.sh --local               # run locally (no AWS needed)
+#   bash scripts/connect_inf2.sh --local --setup       # local bootstrap
+#   bash scripts/connect_inf2.sh --local --test        # local tests
+#   bash scripts/connect_inf2.sh --local --bench       # local benchmark
 #
-# Prerequisites:
+# Prerequisites (remote mode only):
 #   - OpenTofu apply has been run (cd infra && tofu apply)
 #   - aws CLI is configured with credentials that can describe the instance
 #   - For --ssm: aws CLI v2 + Session Manager plugin installed
@@ -26,6 +31,7 @@ RUN_SETUP=0
 RUN_TESTS=0
 RUN_BENCH=0
 USE_SSM=0
+LOCAL=0
 EXTRA_SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
 
 DLAMI_VENV="/opt/aws_neuronx_venv_pytorch_2_8"
@@ -36,15 +42,39 @@ while [[ $# -gt 0 ]]; do
         --test)   RUN_TESTS=1; shift ;;
         --bench)  RUN_BENCH=1; shift ;;
         --ssm)    USE_SSM=1;   shift ;;
+        --local)  LOCAL=1;     shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# LOCAL path — no AWS, no SSH, no tofu
+# ---------------------------------------------------------------------------
+if [[ "${LOCAL}" -eq 1 ]]; then
+    if [[ "${RUN_SETUP}" -eq 1 ]]; then
+        echo "[connect] Running local bootstrap …"
+        bash "${REPO_ROOT}/scripts/setup_inf2.sh" --local
+    fi
+
+    BENCH_FLAG=""
+    [[ "${RUN_BENCH}" -eq 1 ]] && BENCH_FLAG="--bench"
+
+    if [[ "${RUN_TESTS}" -eq 1 ]]; then
+        echo "[connect] Running test suite locally …"
+        bash "${REPO_ROOT}/scripts/run_tests.sh" ${BENCH_FLAG}
+    elif [[ "${RUN_SETUP}" -eq 0 ]]; then
+        echo "[connect] Nothing to do locally. Use --setup, --test, or --bench."
+        echo "          (--local opens no interactive shell)"
+    fi
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Read outputs from OpenTofu state
 # ---------------------------------------------------------------------------
 if ! command -v tofu &>/dev/null; then
     echo "ERROR: 'tofu' not found. Install OpenTofu: https://opentofu.org/docs/intro/install/"
+    echo "       To run locally instead, use: bash scripts/connect_inf2.sh --local"
     exit 1
 fi
 
@@ -116,8 +146,8 @@ if [[ "${RUN_TESTS}" -eq 1 ]]; then
     echo "[connect] Running test suite on the instance …"
     $SSH <<REMOTE
 set -euo pipefail
+cd ~/lqcd-neuron && git pull
 [[ -d "${DLAMI_VENV}" ]] && source "${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
-cd ~/lqcd-neuron
 bash scripts/run_tests.sh ${BENCH_FLAG}
 REMOTE
 fi
