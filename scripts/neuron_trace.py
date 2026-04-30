@@ -90,8 +90,16 @@ def _spawn_monitor(period_s: float) -> subprocess.Popen:
     cfg_file.flush()
     cfg_file.close()
 
+    # neuron-monitor block-buffers stdout when piped; force line buffering
+    # via stdbuf so each JSON record is delivered as it is emitted.
+    cmd: list[str]
+    if shutil.which("stdbuf") is not None:
+        cmd = ["stdbuf", "-oL", "-eL", "neuron-monitor", "-c", cfg_file.name]
+    else:
+        cmd = ["neuron-monitor", "-c", cfg_file.name]
+
     return subprocess.Popen(
-        ["neuron-monitor", "-c", cfg_file.name],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

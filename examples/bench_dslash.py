@@ -108,8 +108,8 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
         use_neuron = False
 
     # Suppress noisy compilation logs — we only want the table
-    logging.getLogger("lqcd_neuron.neuron.compiler").setLevel(logging.WARNING)
-    logging.getLogger("torch_neuronx").setLevel(logging.WARNING)
+    logging.getLogger("lqcd_neuron.neuron.compiler").setLevel(logging.INFO)
+    logging.getLogger("torch_neuronx").setLevel(logging.INFO)
 
     compiler = NeuronCompiler(dtype="bfloat16") if use_neuron else None
     num_cores = get_device().num_cores if use_neuron else 1
