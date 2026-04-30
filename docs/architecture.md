@@ -111,9 +111,21 @@ $$
          + (I+\gamma_\mu)\,U^\dagger(x-\hat\mu,\mu)\,\psi_{x-\hat\mu}\bigr]
 $$
 
-Implemented as six `torch.roll` + `torch.einsum` calls (four directions × two hops).
-The Python `for mu in range(4)` loop is **unrolled at trace time** into a static
-computation graph — exactly what `neuronx-cc` requires.
+The reference `WilsonDslash.forward()` implements this with six `torch.roll` +
+`torch.einsum` calls (four directions × two hops).  The Python
+`for mu in range(4)` loop is **unrolled at trace time** into a static computation
+graph — exactly what `neuronx-cc` requires.
+
+For Neuron compilation a *fused* form is precomputed at trace time (see
+[Performance optimisations](#performance-optimisations) below):
+
+$$
+K^{\text{fwd}}_{\mu,x} = (I-\gamma_\mu)\otimes U(x,\mu),\qquad
+K^{\text{bwd}}_{\mu,x} = (I+\gamma_\mu)\otimes U^\dagger(x-\hat\mu,\mu)
+$$
+
+so that each runtime call is reduced to one $(N_s N_c)\times(N_s N_c)$ matvec
+plus one lattice roll per direction-side.
 
 ---
 
@@ -147,3 +159,74 @@ cached result — matching QUDA's `loadCloverQuda` pattern.
 
 The `NeuronCompiler` maintains an in-process cache keyed by
 `(class_name, shape, dtype)` to avoid redundant compilations within a job.
+
+---
+
+## Performance optimisations
+
+The naive translation — trace `WilsonDirac.forward(psi, U)` and call it in a
+host-side loop — is dominated by overheads that don’t exist on a CPU baseline:
+
+- The full $U$ tensor (~3× the size of $\psi$) crosses PCIe on every call.
+- Each direction-side runs a separate $3\times3$ colour einsum and a $4\times4$
+  spin einsum, neither of which fits the NeuronCore tensor engine’s shape.
+- Eight `torch.roll` ops per call — four for $\psi$ and four for the
+  $U^\dagger(x-\hat\mu,\mu)$ buffer — are pure data movement.
+- Each forward call pays a fixed ~1 ms NeuronCore dispatch cost regardless of
+  problem size.
+
+`NeuronCompiler.compile_dslash()` and `compile_dslash_batched()` apply three
+optimisations to remove these:
+
+### 1. Gauge baking
+
+When `gauge_field=U` is passed to either compile method, the gauge tensor is
+encoded as an `nn.Module` buffer of the traced module.  After
+`torch_neuronx.trace`, that buffer lives on the NeuronCore.  At runtime only
+the spinor crosses PCIe; the wrapper accepts a `U` argument for API
+compatibility but ignores it.
+
+Note: the resulting `.neff` is specific to the baked gauge configuration, so
+it is not reused across solver runs with different $U$.  This trades on-disk
+cacheability for per-call throughput — the right choice for a single inversion
+or a chain of solves on the same configuration.
+
+### 2. Fused spin-colour kernels
+
+With $U$ fixed, the per-site, per-direction operator
+$(I\mp\gamma_\mu)\otimes U^{(\dagger)}(x,\mu)$ can be precomputed once.
+`_build_dslash_kernels()` materialises four buffers of shape
+`(4, T, Z, Y, X, Ns*Nc, Ns*Nc)` containing $K^{\text{fwd/bwd}}_{\mu,x}$ as
+real/imag float pairs.  At runtime each direction-side becomes:
+
+```
+psi_shifted = torch.roll(psi_flat, ±1, dims=mu-5)
+result     -= 0.5 * (K[mu] @ psi_shifted)         # 12×12 matvec
+```
+
+This collapses the 3×3 colour and 4×4 spin contractions into a single
+12×12 matvec per direction-side and eliminates the four backward-$U$ rolls
+(absorbed into `K_bwd`).  The 12×12 shape is also a much better fit for the
+NeuronCore tensor engine than the original tiny einsums.
+
+### 3. Multi-RHS batching
+
+`compile_dslash_batched(D, shape, batch_size=B, gauge_field=U)` traces the
+fused operator on a batched spinor of shape `(B, T, Z, Y, X, Ns, Nc)`.  The
+baked $K$ buffers carry a singleton batch dim that broadcasts across all $B$
+right-hand sides, and the lattice rolls use negative-dim indexing so the
+leading batch axis does not shift them.
+
+Multi-RHS amortises the fixed per-call dispatch cost across $B$ problems and
+turns each $12\times12$ matvec into an $N_b \times 12 \times 12$ matmul that
+the NeuronCore tensor engine can saturate.  This pattern matches production
+multi-source LQCD propagator inverters, which already solve for one RHS per
+source spin×colour combination.
+
+### Verifying correctness
+
+The fused kernels are bit-equivalent to `WilsonDirac.forward()` up to
+float32 round-off (relative error ≲ $10^{-7}$).  The single-RHS path
+also continues to satisfy the existing Dirac unit tests
+(adjoint relation, $\gamma_5$-Hermiticity, normal-operator positivity)
+automatically, since they exercise `WilsonDirac.forward()` directly on CPU.

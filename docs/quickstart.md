@@ -149,10 +149,14 @@ from lqcd_neuron.neuron import NeuronCompiler, is_neuron_available
 if is_neuron_available():
     compiler = NeuronCompiler(dtype="bfloat16")
 
-    # Compile once — neuronx-cc runs and writes .neff to ~/.cache/lqcd-neuron/
-    D_neuron = compiler.compile_dslash(D, lattice_shape=geom.shape, nc=geom.nc)
+    # Recommended: pass `gauge_field=U` so the compiler can pre-fuse the
+    # spin/colour hopping kernels and bake U into the .neff as a buffer.
+    # The wrapper still accepts (psi, U) for API compatibility — U is
+    # already on the NeuronCore so the second argument is ignored.
+    D_neuron = compiler.compile_dslash(
+        D, lattice_shape=geom.shape, nc=geom.nc, gauge_field=U.tensor,
+    )
 
-    # Subsequent calls hit the on-disk cache immediately
     Dpsi_neuron = D_neuron(psi.tensor, U.tensor)
 ```
 
@@ -165,6 +169,30 @@ def matvec_neuron(v):
 
 x_neuron, info = ConjugateGradient(tol=1e-8).solve(matvec_neuron, b_rhs)
 ```
+
+### Multi-RHS (batched) inversion
+
+For propagator calculations that need multiple right-hand sides, compile a
+batched operator instead.  This amortises the fixed per-call NeuronCore
+dispatch cost across all `B` spinors and is the highest-throughput path:
+
+```python
+import torch
+
+B = 12   # e.g. one RHS per spin × colour source
+D_batched = compiler.compile_dslash_batched(
+    D, lattice_shape=geom.shape, batch_size=B,
+    gauge_field=U.tensor, nc=geom.nc,
+)
+
+# psi_batch shape: (B, T, Z, Y, X, Ns, Nc)
+psi_batch = torch.stack([psi.tensor for _ in range(B)], dim=0)
+out_batch = D_batched(psi_batch)
+```
+
+> **Note:** the `.neff` produced by the gauge-baked path is specific to the
+> exact gauge configuration passed in.  Re-compile (cheap once warm) when `U`
+> changes between solves.
 
 ---
 

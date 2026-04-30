@@ -54,7 +54,8 @@ User Python code
 |                      | `wilson_action`              | Wilson gauge action S_W                            |
 |                      | `topological_charge`         | Clover-definition topological charge Q              |
 |                      | `polyakov_loop`              | Spatially-averaged Polyakov loop ⟨L⟩               |
-| **Neuron utilities** | `NeuronCompiler`             | `torch_neuronx.trace` wrapper with shape cache     |
+| **Neuron utilities** | `NeuronCompiler`             | `torch_neuronx.trace` wrapper; gauge-baking + fused kernels |
+|                      | `compile_dslash_batched`     | Multi-RHS Dslash compilation for amortised dispatch |
 |                      | `NeuronDevice`               | Hardware detection (Trn1 / Inf2 / CPU fallback)    |
 
 
@@ -111,10 +112,57 @@ from lqcd_neuron.neuron import NeuronCompiler
 
 D         = WilsonDirac(mass=0.1)
 compiler  = NeuronCompiler(dtype="bfloat16")
-D_neuron  = compiler.compile_dslash(D, lattice_shape=(8, 4, 4, 4), nc=3)
 
-# D_neuron(psi, U) now executes on NeuronCores
+# Recommended: pass `gauge_field=U` so the compiler can pre-fuse the
+# spin/colour hopping kernels and bake U into the .neff as a buffer.
+# Only the spinor crosses PCIe per call.
+D_neuron  = compiler.compile_dslash(
+    D, lattice_shape=(8, 4, 4, 4), nc=3, gauge_field=U,
+)
+
+# D_neuron(psi, U) now executes on NeuronCores; the second arg is
+# accepted for API compatibility but ignored (U is already on-device).
 out = D_neuron(psi, U)
+
+# Multi-RHS: amortise per-call dispatch overhead across N right-hand sides
+D_batched = compiler.compile_dslash_batched(
+    D, lattice_shape=(8, 4, 4, 4), batch_size=8, gauge_field=U, nc=3,
+)
+out_batch = D_batched(psi_batch)   # psi_batch shape: (8, T, Z, Y, X, Ns, Nc)
+```
+
+
+## Performance
+
+Wilson Dslash throughput on a single Inf2 NeuronCore-v2 (BF16) vs CPU (FP32),
+50 iterations after warm-up.  Numbers in **applications/sec** (higher is better).
+
+| Lattice    | CPU  | Neuron (1-RHS) | Neuron (8-RHS) | Speedup vs CPU |
+|------------|-----:|---------------:|---------------:|---------------:|
+| 4×4×4×4    |  818 |           1419 |       **8957** |     **10.9×** |
+| 8×4×4×4    |  767 |            794 |       **4918** |      **6.4×** |
+| 8×8×4×4    |  646 |            372 |       **2481** |      **3.8×** |
+| 8×8×8×4    |  449 |            208 |       **1379** |      **3.1×** |
+
+Three compile-time optimisations make this possible:
+
+1. **Gauge baking** — when `gauge_field=U` is passed to `compile_dslash`, the
+   gauge configuration is embedded in the `.neff` as a NeuronCore-resident
+   buffer.  Only the spinor crosses PCIe per call.
+2. **Fused spin-colour kernels** — each direction’s `(I ∓ γ_μ) ⊗ U(x,μ)`
+   block is precomputed as a 12×12 matrix per site, replacing the per-call
+   3×3 colour einsum + 4×4 spin einsum with a single matvec that maps cleanly
+   onto the NeuronCore tensor engine.
+3. **Multi-RHS batching** — `compile_dslash_batched(…, batch_size=B)` solves
+   *B* spinors per call, amortising the ~1 ms per-call NeuronCore dispatch
+   overhead.  This is the same pattern used by production multi-source LQCD
+   propagator inverters.
+
+Reproduce locally with:
+
+```bash
+make bench-neuron        # on an Inf2 / Trn1 instance
+make connect-bench       # SSH into the OpenTofu-provisioned instance
 ```
 
 
