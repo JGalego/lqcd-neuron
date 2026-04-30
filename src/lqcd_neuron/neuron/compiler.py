@@ -445,8 +445,8 @@ class _MultiCoreDslashWrapper(nn.Module):
     runs each slice through the DataParallel-wrapped compiled model,
     and reassembles the results.
 
-    ``forward(psi)`` accepts ``(B, T, Z, Y, X, Ns, Nc)`` where B must
-    be divisible by *num_cores*.
+    ``forward(psi)`` accepts ``(B, T, Z, Y, X, Ns, Nc)`` where
+    ``B == num_cores * per_core_batch_size``.
     """
 
     def __init__(
@@ -454,14 +454,24 @@ class _MultiCoreDslashWrapper(nn.Module):
         parallel_module: nn.Module,
         compute_dtype: torch.dtype = torch.float32,
         num_cores: int = 1,
+        per_core_batch_size: int = 1,
     ) -> None:
         super().__init__()
         self._parallel_module = parallel_module
         self._compute_dtype = compute_dtype
         self.num_cores = num_cores
+        self.per_core_batch_size = per_core_batch_size
+        self.global_batch_size = num_cores * per_core_batch_size
 
     @torch.inference_mode()
     def forward(self, psi: torch.Tensor) -> torch.Tensor:
+        if psi.shape[0] != self.global_batch_size:
+            raise ValueError(
+                f"_MultiCoreDslashWrapper: psi.shape[0]={psi.shape[0]} but "
+                f"expected num_cores * per_core_batch_size = "
+                f"{self.num_cores} * {self.per_core_batch_size} = "
+                f"{self.global_batch_size}"
+            )
         dt = self._compute_dtype
         # DataParallel splits dim 0 across cores automatically
         r_re, r_im = self._parallel_module(
@@ -927,30 +937,35 @@ class NeuronCompiler:
         lattice_shape: Tuple[int, int, int, int],
         gauge_field: torch.Tensor,
         num_cores: Optional[int] = None,
+        per_core_batch_size: int = 1,
         nc: int = 3,
         ns: int = 4,
     ) -> nn.Module:
         """Compile a multi-core data-parallel Dslash operator.
 
         Distributes batched spinors across multiple NeuronCores for maximum
-        throughput.  Each core processes ``batch_size // num_cores`` right-hand
-        sides concurrently.
+        throughput.  Each core processes ``per_core_batch_size`` right-hand
+        sides concurrently; the host splits a global batch of
+        ``num_cores * per_core_batch_size`` RHS along dim 0.
 
         The gauge field is baked into each core's compiled model, so only the
         spinor crosses PCIe per call.
 
         Args:
-            dslash_module:  A ``WilsonDslash`` or ``WilsonDirac`` instance.
-            lattice_shape:  ``(T, Z, Y, X)`` lattice extents.
-            gauge_field:    Gauge tensor ``(T, Z, Y, X, 4, Nc, Nc)`` complex64.
-            num_cores:      NeuronCores to use (default: all detected).
-            nc:             Number of colours.
-            ns:             Number of spin components.
+            dslash_module:        ``WilsonDslash`` or ``WilsonDirac`` instance.
+            lattice_shape:        ``(T, Z, Y, X)`` lattice extents.
+            gauge_field:          Gauge tensor ``(T,Z,Y,X,4,Nc,Nc)`` complex64.
+            num_cores:            NeuronCores to use (default: all detected).
+            per_core_batch_size:  RHS handled by each core per call.  Larger
+                                  values amortise dispatch overhead and fill
+                                  the tensor engine better.
+            nc:                   Number of colours.
+            ns:                   Number of spin components.
 
         Returns:
-            A :class:`_MultiCoreDslashWrapper` with ``forward(psi)`` accepting
-            a batched complex64 spinor ``(B, T, Z, Y, X, Ns, Nc)`` where
-            ``B`` must be divisible by *num_cores*.
+            A :class:`_MultiCoreDslashWrapper` whose ``forward(psi)`` accepts
+            a batched complex64 spinor ``(B, T, Z, Y, X, Ns, Nc)`` with
+            ``B == num_cores * per_core_batch_size``.
         """
         from ..dirac.wilson import WilsonDirac, WilsonDslash
 
@@ -990,12 +1005,18 @@ class NeuronCompiler:
             diag=diag, ns=ns, nc=nc,
         ).to(dt)
 
-        # Example inputs: single RHS per core (DataParallel splits dim 0)
-        psi_re = torch.zeros(1, T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+        # Each core's NEFF is compiled for per_core_batch_size RHS;
+        # DataParallel splits the global dim-0 batch evenly across cores.
+        psi_re = torch.zeros(per_core_batch_size, T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
         psi_im = torch.zeros_like(psi_re)
 
         parallel = self.compile_multicore(fused, (psi_re, psi_im), num_cores=num_cores)
-        return _MultiCoreDslashWrapper(parallel, compute_dtype=dt, num_cores=num_cores)
+        return _MultiCoreDslashWrapper(
+            parallel,
+            compute_dtype=dt,
+            num_cores=num_cores,
+            per_core_batch_size=per_core_batch_size,
+        )
 
     # ------------------------------------------------------------------
     # torch.compile backend (PyTorch 2.x alternative to trace)

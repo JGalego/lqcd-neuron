@@ -106,13 +106,21 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
 
     compiler = NeuronCompiler(dtype="bfloat16") if use_neuron else None
     num_cores = get_device().num_cores if use_neuron else 1
+    show_multicore = use_neuron and num_cores > 1
+    MC_COL_WIDTH = 22
 
     if use_neuron:
-        mc_label = f"Multicore x{num_cores} (apps/s)"
-        header = (f"{'Lattice':>16}  {'CPU (apps/s)':>14}  "
-                  f"{'Neuron (apps/s)':>16}  "
-                  f"{f'Neuron x{BATCH_SIZE} (apps/s)':>22}  "
-                  f"{mc_label:>{len(mc_label)}}  {'Speedup':>8}")
+        cols = [
+            f"{'Lattice':>16}",
+            f"{'CPU (apps/s)':>14}",
+            f"{'Neuron (apps/s)':>16}",
+            f"{f'Neuron x{BATCH_SIZE} (apps/s)':>22}",
+        ]
+        if show_multicore:
+            mc_label = f"Multicore x{num_cores} (apps/s)"
+            cols.append(f"{mc_label:>{MC_COL_WIDTH}}")
+        cols.append(f"{'Speedup':>8}")
+        header = "  ".join(cols)
         ruler  = "-" * len(header)
     else:
         header = f"{'Lattice':>16}  {'CPU (apps/s)':>14}"
@@ -150,20 +158,23 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
 
             # Multi-core data-parallel path
             mc_aps = 0.0
-            if num_cores > 1:
+            if show_multicore:
+                # Each core handles BATCH_SIZE RHS; global batch = cores * BATCH_SIZE
                 mc_batch = num_cores * BATCH_SIZE
                 print(f"{row:>16}  compiling multicore ({num_cores} cores) …",
                       end="\r", flush=True)
                 D_mc = compiler.compile_dslash_multicore(
-                    D, shape, gauge_field=U, num_cores=num_cores, nc=nc
+                    D, shape, gauge_field=U, num_cores=num_cores,
+                    per_core_batch_size=BATCH_SIZE, nc=nc,
                 )
                 psi_mc = psi.unsqueeze(0).expand(mc_batch, *psi.shape).contiguous()
                 mc_aps = benchmark_batched(D_mc, psi_mc)
 
             speedup = (mc_aps if mc_aps > 0 else batched_aps) / cpu_aps
-            line += (f"  {neuron_aps:>16.1f}  {batched_aps:>22.1f}  "
-                     f"{mc_aps:>{len(mc_label)}.1f}  "
-                     f"{speedup:>7.1f}x")
+            line += f"  {neuron_aps:>16.1f}  {batched_aps:>22.1f}"
+            if show_multicore:
+                line += f"  {mc_aps:>{MC_COL_WIDTH}.1f}"
+            line += f"  {speedup:>7.1f}x"
 
         print(line)
 
