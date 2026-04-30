@@ -46,6 +46,7 @@ LATTICE_SIZES: List[Tuple[int, int, int, int]] = [
 
 WARMUP_ITERS = 5
 BENCH_ITERS  = 50
+BATCH_SIZE   = 8   # multi-RHS batch size for the batched Neuron column
 
 
 def benchmark_one(
@@ -70,6 +71,30 @@ def benchmark_one(
     return n / elapsed
 
 
+def benchmark_batched(
+    matvec,
+    psi_batch: torch.Tensor,
+    n: int = BENCH_ITERS,
+    warmup: int = WARMUP_ITERS,
+) -> float:
+    """Return per-RHS applications/second for a batched ``matvec(psi)``.
+
+    Each call applies the operator to ``psi_batch.shape[0]`` right-hand
+    sides simultaneously, so we report ``n * B / elapsed`` for an
+    apples-to-apples comparison with the single-RHS columns.
+    """
+    B = psi_batch.shape[0]
+    with torch.inference_mode():
+        for _ in range(warmup):
+            _ = matvec(psi_batch)
+
+        t0 = time.perf_counter()
+        for _ in range(n):
+            out = matvec(psi_batch)
+        elapsed = time.perf_counter() - t0
+    return n * B / elapsed
+
+
 def run(use_neuron: bool, mass: float = 0.1) -> None:
     dtype = torch.complex64
     nc    = 3
@@ -81,9 +106,16 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
 
     compiler = NeuronCompiler(dtype="bfloat16") if use_neuron else None
 
-    print(f"\n{'Lattice':>16}  {'CPU (apps/s)':>14}  "
-          + (f"{'Neuron (apps/s)':>16}  {'Speedup':>8}" if use_neuron else ""))
-    print("-" * (55 if use_neuron else 38))
+    if use_neuron:
+        header = (f"{'Lattice':>16}  {'CPU (apps/s)':>14}  "
+                  f"{'Neuron (apps/s)':>16}  "
+                  f"{f'Neuron x{BATCH_SIZE} (apps/s)':>22}  {'Speedup':>8}")
+        ruler  = "-" * len(header)
+    else:
+        header = f"{'Lattice':>16}  {'CPU (apps/s)':>14}"
+        ruler  = "-" * len(header)
+    print("\n" + header)
+    print(ruler)
 
     for shape in LATTICE_SIZES:
         T, Z, Y, X = shape
@@ -99,12 +131,23 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
         line = f"{row:>16}  {cpu_aps:>14.1f}"
 
         if use_neuron:
-            # AoT compile (first call is slow; result cached to disk)
+            # Single-RHS Neuron path
             print(f"{row:>16}  compiling for Neuron …", end="\r", flush=True)
             D_n = compiler.compile_dslash(D, shape, nc=nc, gauge_field=U)
             neuron_aps = benchmark_one(D_n, psi, U, label="Neuron")
-            speedup    = neuron_aps / cpu_aps
-            line += f"  {neuron_aps:>16.1f}  {speedup:>7.1f}x"
+
+            # Multi-RHS Neuron path
+            print(f"{row:>16}  compiling batched (B={BATCH_SIZE}) …",
+                  end="\r", flush=True)
+            D_b = compiler.compile_dslash_batched(
+                D, shape, batch_size=BATCH_SIZE, gauge_field=U, nc=nc
+            )
+            psi_batch = psi.unsqueeze(0).expand(BATCH_SIZE, *psi.shape).contiguous()
+            batched_aps = benchmark_batched(D_b, psi_batch)
+
+            speedup = batched_aps / cpu_aps
+            line += (f"  {neuron_aps:>16.1f}  {batched_aps:>22.1f}  "
+                     f"{speedup:>7.1f}x")
 
         print(line)
 

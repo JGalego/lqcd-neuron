@@ -89,7 +89,10 @@ class WilsonDslash(nn.Module):
             U_mu = U[..., mu, :, :]           # (T,Z,Y,X, Nc, Nc)
 
             # ---- Forward hop: contribution from ψ(x+μ̂) ---------------
-            psi_fwd = torch.roll(psi, -1, dims=mu)
+            # Negative dim indexing so an optional leading batch (multi-RHS)
+            # dimension does not shift the lattice axes.  T,Z,Y,X always sit
+            # at positions -6..-3 of psi and U_mu.
+            psi_fwd = torch.roll(psi, -1, dims=mu - 6)
             # Colour matrix-vector multiply: ψ̃(x) = U(x,μ) ψ(x+μ̂)
             # U_mu[...,i,j] × psi_fwd[...,s,j] → (...)si
             Upsi_fwd = torch.einsum("...ij,...sj->...si", U_mu, psi_fwd)
@@ -97,9 +100,9 @@ class WilsonDslash(nn.Module):
             contrib_fwd = torch.einsum("ij,...jk->...ik", self.P_minus[mu], Upsi_fwd)
 
             # ---- Backward hop: contribution from ψ(x−μ̂) --------------
-            psi_bwd = torch.roll(psi, 1, dims=mu)
+            psi_bwd = torch.roll(psi, 1, dims=mu - 6)
             # Back-shifted U† : U†(x−μ̂,μ) = conj-transpose of U(x−μ̂,μ)
-            U_mu_bwd = torch.roll(U_mu, 1, dims=mu)
+            U_mu_bwd = torch.roll(U_mu, 1, dims=mu - 6)
             # U†[...,i,j] = conj(U[...,j,i])  →  einsum index swap
             Upsi_bwd = torch.einsum("...ji,...sj->...si", U_mu_bwd.conj(), psi_bwd)
             contrib_bwd = torch.einsum("ij,...jk->...ik", self.P_plus[mu], Upsi_bwd)
@@ -160,14 +163,14 @@ class WilsonDirac(nn.Module):
         U_lat = U
         for mu in range(4):
             U_mu = U_lat[..., mu, :, :]
-            psi_fwd = torch.roll(psi, -1, dims=mu)
+            psi_fwd = torch.roll(psi, -1, dims=mu - 6)
             Upsi_fwd = torch.einsum("...ij,...sj->...si", U_mu, psi_fwd)
             # Dagger: swap P_minus ↔ P_plus
             contrib_fwd = torch.einsum(
                 "ij,...jk->...ik", self.hop.P_plus[mu], Upsi_fwd
             )
-            psi_bwd = torch.roll(psi, 1, dims=mu)
-            U_mu_bwd = torch.roll(U_mu, 1, dims=mu)
+            psi_bwd = torch.roll(psi, 1, dims=mu - 6)
+            U_mu_bwd = torch.roll(U_mu, 1, dims=mu - 6)
             Upsi_bwd = torch.einsum("...ji,...sj->...si", U_mu_bwd.conj(), psi_bwd)
             contrib_bwd = torch.einsum(
                 "ij,...jk->...ik", self.hop.P_minus[mu], Upsi_bwd
@@ -268,19 +271,24 @@ class _NeuronWilsonDslashAdapter(nn.Module):
             U_mu_re = U_re[..., mu, :, :]
             U_mu_im = U_im[..., mu, :, :]
 
+            # Negative dim indexing: lattice axes T,Z,Y,X live at -6..-3
+            # of both psi (..., T,Z,Y,X, Ns, Nc) and U_mu (..., T,Z,Y,X, Nc, Nc),
+            # so an optional leading batch (multi-RHS) dim does not shift them.
+            ldim = mu - 6
+
             # Forward hop: − ½ (I−γ_μ) U(x,μ) ψ(x+μ̂)
-            pf_re = torch.roll(psi_re, -1, dims=mu)
-            pf_im = torch.roll(psi_im, -1, dims=mu)
+            pf_re = torch.roll(psi_re, -1, dims=ldim)
+            pf_im = torch.roll(psi_im, -1, dims=ldim)
             Upf_re, Upf_im = self._color_mv(U_mu_re, U_mu_im, pf_re, pf_im)
             cf_re, cf_im = self._spin_mv(
                 self.P_minus_re[mu], self.P_minus_im[mu], Upf_re, Upf_im
             )
 
             # Backward hop: − ½ (I+γ_μ) U†(x−μ̂,μ) ψ(x−μ̂)
-            pb_re = torch.roll(psi_re, 1, dims=mu)
-            pb_im = torch.roll(psi_im, 1, dims=mu)
-            Ub_re = torch.roll(U_mu_re, 1, dims=mu)
-            Ub_im = torch.roll(U_mu_im, 1, dims=mu)
+            pb_re = torch.roll(psi_re, 1, dims=ldim)
+            pb_im = torch.roll(psi_im, 1, dims=ldim)
+            Ub_re = torch.roll(U_mu_re, 1, dims=ldim)
+            Ub_im = torch.roll(U_mu_im, 1, dims=ldim)
             Upb_re, Upb_im = self._color_dag_mv(Ub_re, Ub_im, pb_re, pb_im)
             cb_re, cb_im = self._spin_mv(
                 self.P_plus_re[mu], self.P_plus_im[mu], Upb_re, Upb_im

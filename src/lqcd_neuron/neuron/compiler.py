@@ -185,6 +185,56 @@ class _BakedGaugeDslashWrapper(nn.Module):
         return torch.complex(r_re.float(), r_im.float())
 
 
+class _BakedGaugeBatchedAdapter(nn.Module):
+    """Multi-RHS Dslash adapter with the gauge field baked as a buffer.
+
+    Adds a leading singleton dim to *U_re/U_im* so a batched psi of shape
+    ``(B, T, Z, Y, X, Ns, Nc)`` broadcasts cleanly through the underlying
+    adapter's einsums.  The lattice rolls in the adapter use negative dim
+    indices so the leading batch dim does not shift them.
+    """
+
+    def __init__(
+        self,
+        adapter: nn.Module,
+        U_re: torch.Tensor,
+        U_im: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.adapter = adapter
+        # Singleton batch dim broadcasts across all right-hand sides.
+        self.register_buffer("U_re", U_re.unsqueeze(0))
+        self.register_buffer("U_im", U_im.unsqueeze(0))
+
+    def forward(
+        self, psi_re: torch.Tensor, psi_im: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.adapter(psi_re, psi_im, self.U_re, self.U_im)
+
+
+class _BakedGaugeBatchedDslashWrapper(nn.Module):
+    """Host-side shim for multi-RHS Dslash with the gauge field baked.
+
+    Accepts a batched complex64 spinor ``psi`` of shape
+    ``(B, T, Z, Y, X, Ns, Nc)``.  Returns a complex64 tensor of the same
+    shape.  The gauge field is already on the NeuronCore.
+    """
+
+    def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
+        super().__init__()
+        self._real_module = real_module
+        self._compute_dtype = compute_dtype
+
+    @torch.inference_mode()
+    def forward(self, psi: torch.Tensor) -> torch.Tensor:
+        dt = self._compute_dtype
+        r_re, r_im = self._real_module(
+            psi.real.to(dt).contiguous(),
+            psi.imag.to(dt).contiguous(),
+        )
+        return torch.complex(r_re.float(), r_im.float())
+
+
 class NeuronCompiler:
     """Compile ``nn.Module`` operators for execution on Neuron hardware.
 
@@ -400,6 +450,89 @@ class NeuronCompiler:
         key = f"dslash_{type(dslash_module).__name__}_{lattice_shape}_{nc}_{dt}"
         compiled = self.compile(adapter, (psi_re, psi_im, U_re, U_im), cache_key=key)
         return _ComplexDslashWrapper(compiled, compute_dtype=dt)
+
+    def compile_dslash_batched(
+        self,
+        dslash_module: nn.Module,
+        lattice_shape: Tuple[int, int, int, int],
+        batch_size: int,
+        gauge_field: torch.Tensor,
+        nc: int = 3,
+        ns: int = 4,
+    ) -> nn.Module:
+        """Compile a multi-RHS Wilson Dslash / Dirac operator.
+
+        Multi-RHS amortises the fixed NeuronCore dispatch overhead (~1 ms
+        per call) across *batch_size* spinors and lets the tensor engine
+        operate on larger contractions, dramatically improving throughput
+        on the small-to-medium lattices typical for LQCD inversions.
+
+        The gauge field is baked into the compiled model as a NeuronCore-
+        resident buffer (broadcast across the batch dim), so only the
+        batched spinor crosses PCIe per call.
+
+        Args:
+            dslash_module: A ``WilsonDslash`` or ``WilsonDirac`` instance.
+            lattice_shape: ``(T, Z, Y, X)`` lattice extents.
+            batch_size:    Number of right-hand sides per call.
+            gauge_field:   Gauge tensor ``(T, Z, Y, X, 4, Nc, Nc)`` of
+                           ``complex64``.  Required — the NEFF embeds this
+                           specific configuration.
+            nc:            Number of colours.
+            ns:            Number of spin components.
+
+        Returns:
+            Module whose ``forward(psi)`` accepts a batched complex64
+            spinor of shape ``(batch_size, T, Z, Y, X, Ns, Nc)``.
+        """
+        from ..dirac.wilson import (
+            WilsonDirac,
+            WilsonDslash,
+            _NeuronWilsonDiracAdapter,
+            _NeuronWilsonDslashAdapter,
+        )
+
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — returning a host-side batched shim."
+            )
+
+            class _CpuBatched(nn.Module):
+                def __init__(self, m: nn.Module, U_: torch.Tensor) -> None:
+                    super().__init__()
+                    self.m = m
+                    self.U = U_
+
+                def forward(self, psi: torch.Tensor) -> torch.Tensor:
+                    return self.m(psi, self.U)
+
+            return _CpuBatched(dslash_module, gauge_field)
+
+        if isinstance(dslash_module, WilsonDirac):
+            adapter: nn.Module = _NeuronWilsonDiracAdapter(
+                mass=dslash_module.mass, nc=nc
+            )
+        elif isinstance(dslash_module, WilsonDslash):
+            adapter = _NeuronWilsonDslashAdapter(nc=nc)
+        else:
+            raise TypeError(
+                f"compile_dslash_batched: unsupported module type "
+                f"{type(dslash_module).__name__}.  Only WilsonDslash and "
+                f"WilsonDirac are currently supported."
+            )
+
+        T, Z, Y, X = lattice_shape
+        dt = self.torch_dtype
+        cpu = torch.device("cpu")
+
+        U_re = gauge_field.real.to(dt).contiguous()
+        U_im = gauge_field.imag.to(dt).contiguous()
+        baked = _BakedGaugeBatchedAdapter(adapter, U_re, U_im).to(dt)
+        psi_re = torch.zeros(batch_size, T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+        psi_im = torch.zeros_like(psi_re)
+        # No cache key — the NEFF embeds this specific gauge configuration.
+        compiled = self.compile(baked, (psi_re, psi_im))
+        return _BakedGaugeBatchedDslashWrapper(compiled, compute_dtype=dt)
 
     def compile_observable(
         self,

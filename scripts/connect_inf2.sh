@@ -159,7 +159,7 @@ if [[ "${RUN_BENCH}" -eq 1 ]]; then
     echo "[connect] Running benchmark on the instance …"
     $SSH <<REMOTE
 set -euo pipefail
-cd ~/lqcd-neuron
+cd ~/lqcd-neuron && git pull
 [[ -d "${DLAMI_VENV}" ]] && source "${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
 bash scripts/run_tests.sh --bench --neuron
 REMOTE
