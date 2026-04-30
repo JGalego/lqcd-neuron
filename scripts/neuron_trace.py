@@ -111,8 +111,12 @@ class Sample:
     cores: dict[int, float] = field(default_factory=dict)  # core_id -> util [0,1]
 
 
+_known_core_ids: set[int] = set()
+
+
 def _extract_sample(record: dict, t0: float) -> Sample | None:
     """Pull per-NeuronCore utilization out of a neuron-monitor JSON record."""
+    global _known_core_ids
     runtimes = record.get("neuron_runtime_data") or []
     cores: dict[int, float] = {}
 
@@ -150,8 +154,16 @@ def _extract_sample(record: dict, t0: float) -> Sample | None:
         if nc_count:
             cores = {i: 0.0 for i in range(nc_count)}
 
+    # Fall back to previously discovered cores (hardware info may only
+    # appear in the first record).
+    if not cores and _known_core_ids:
+        cores = {cid: 0.0 for cid in _known_core_ids}
+
     if not cores:
         return None
+
+    # Remember discovered cores for future records
+    _known_core_ids.update(cores.keys())
 
     wall = record.get("timestamp", "")
     return Sample(t=time.monotonic() - t0, wall=wall, cores=cores)
