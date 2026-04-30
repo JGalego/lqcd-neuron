@@ -235,6 +235,209 @@ class _BakedGaugeBatchedDslashWrapper(nn.Module):
         return torch.complex(r_re.float(), r_im.float())
 
 
+# ---------------------------------------------------------------------------
+# Fused spin-color hopping kernels
+# ---------------------------------------------------------------------------
+#
+# When the gauge field is fixed, the per-site, per-direction operator
+#
+#     K_fwd[μ, x] = (I − γ_μ) ⊗ U(x, μ)            (4Nc × 4Nc)
+#     K_bwd[μ, x] = (I + γ_μ) ⊗ U†(x − μ̂, μ)         (4Nc × 4Nc)
+#
+# can be precomputed once at compile time and baked into the model as a
+# NeuronCore-resident buffer.  At runtime each Dslash call then performs
+# only:
+#
+#   1. roll the (flattened, ns*nc-sized) spinor along each lattice axis
+#   2. one (Ns*Nc) × (Ns*Nc) matrix-vector multiply per direction-side
+#   3. sum the eight contributions
+#
+# This eliminates the four per-call backward-U rolls, fuses the spin
+# projector and colour matvec into a single contraction, and presents a
+# 12 × 12 matmul to the NeuronCore tensor engine — a much better fit than
+# the original 4×4 spin and 3×3 colour einsums.
+# ---------------------------------------------------------------------------
+
+
+def _build_dslash_kernels(
+    U: torch.Tensor,
+    *,
+    nc: int,
+    ns: int,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pre-compute the fused spin-color hopping kernels for a fixed *U*.
+
+    Returns ``(K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im)``, each of shape
+    ``(4, T, Z, Y, X, ns*nc, ns*nc)`` and dtype *dtype*.
+    """
+    from ..dirac.gamma import degrand_rossi_gammas
+
+    G  = degrand_rossi_gammas(dtype=torch.complex64)        # (4, 4, 4)
+    I4 = torch.eye(4, dtype=torch.complex64)
+    P_minus = torch.stack([I4 - G[mu] for mu in range(4)], dim=0)  # (4, 4, 4)
+    P_plus  = torch.stack([I4 + G[mu] for mu in range(4)], dim=0)
+
+    T, Z, Y, X = U.shape[:4]
+    Uc = U.to(torch.complex64)
+
+    K_fwd = torch.empty(4, T, Z, Y, X, ns * nc, ns * nc, dtype=torch.complex64)
+    K_bwd = torch.empty_like(K_fwd)
+    for mu in range(4):
+        U_mu = Uc[..., mu, :, :]                            # (T,Z,Y,X, nc, nc)
+        # U†(x − μ̂, μ) absorbs the per-call backward roll
+        U_mu_bwd = torch.roll(U_mu, 1, dims=mu).conj().transpose(-1, -2)
+        # Kronecker product P[s, s'] * U[c, c'] -> (T,Z,Y,X, ns, nc, ns, nc)
+        # then flatten the (s, c) and (s', c') pairs into ns*nc.
+        K_fwd[mu] = torch.einsum(
+            "ab,...ij->...aibj", P_minus[mu], U_mu
+        ).reshape(T, Z, Y, X, ns * nc, ns * nc)
+        K_bwd[mu] = torch.einsum(
+            "ab,...ij->...aibj", P_plus[mu], U_mu_bwd
+        ).reshape(T, Z, Y, X, ns * nc, ns * nc)
+
+    return (
+        K_fwd.real.to(dtype).contiguous(),
+        K_fwd.imag.to(dtype).contiguous(),
+        K_bwd.real.to(dtype).contiguous(),
+        K_bwd.imag.to(dtype).contiguous(),
+    )
+
+
+class _FusedDslashAdapter(nn.Module):
+    """Wilson Dslash / Dirac with pre-fused spin-color kernels.
+
+    Single-RHS path.  ``K_*`` buffers have shape
+    ``(4, T, Z, Y, X, ns*nc, ns*nc)`` and are NeuronCore-resident after
+    ``torch_neuronx.trace``.
+
+    Args:
+        diag: Diagonal coefficient ``(4 + mass)`` for the Dirac operator,
+              or ``0.0`` for the bare Dslash hopping term.
+        ns, nc: Spin and colour counts (used only for the final reshape).
+    """
+
+    def __init__(
+        self,
+        K_fwd_re: torch.Tensor, K_fwd_im: torch.Tensor,
+        K_bwd_re: torch.Tensor, K_bwd_im: torch.Tensor,
+        diag: float, ns: int, nc: int,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("K_fwd_re", K_fwd_re)
+        self.register_buffer("K_fwd_im", K_fwd_im)
+        self.register_buffer("K_bwd_re", K_bwd_re)
+        self.register_buffer("K_bwd_im", K_bwd_im)
+        self.diag = float(diag)
+        self.ns = ns
+        self.nc = nc
+
+    def forward(
+        self, psi_re: torch.Tensor, psi_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Flatten spin×colour into a single ns*nc dim so the fused 12×12
+        # matvec maps straight onto the tensor engine.
+        pr = psi_re.flatten(-2)        # (..., T, Z, Y, X, ns*nc)
+        pi = psi_im.flatten(-2)
+
+        out_re = self.diag * pr
+        out_im = self.diag * pi
+
+        for mu in range(4):
+            # Lattice axes T,Z,Y,X live at positions -5..-2 of the flat tensor.
+            ldim = mu - 5
+
+            Kfr, Kfi = self.K_fwd_re[mu], self.K_fwd_im[mu]
+            Kbr, Kbi = self.K_bwd_re[mu], self.K_bwd_im[mu]
+
+            pf_re = torch.roll(pr, -1, dims=ldim)
+            pf_im = torch.roll(pi, -1, dims=ldim)
+            pb_re = torch.roll(pr,  1, dims=ldim)
+            pb_im = torch.roll(pi,  1, dims=ldim)
+
+            # Complex matvec K @ psi (real arithmetic):
+            cf_re = (torch.einsum("...ij,...j->...i", Kfr, pf_re)
+                   - torch.einsum("...ij,...j->...i", Kfi, pf_im))
+            cf_im = (torch.einsum("...ij,...j->...i", Kfr, pf_im)
+                   + torch.einsum("...ij,...j->...i", Kfi, pf_re))
+            cb_re = (torch.einsum("...ij,...j->...i", Kbr, pb_re)
+                   - torch.einsum("...ij,...j->...i", Kbi, pb_im))
+            cb_im = (torch.einsum("...ij,...j->...i", Kbr, pb_im)
+                   + torch.einsum("...ij,...j->...i", Kbi, pb_re))
+
+            out_re = out_re - 0.5 * (cf_re + cb_re)
+            out_im = out_im - 0.5 * (cf_im + cb_im)
+
+        out_re = out_re.unflatten(-1, (self.ns, self.nc))
+        out_im = out_im.unflatten(-1, (self.ns, self.nc))
+        return out_re, out_im
+
+
+class _FusedBatchedDslashAdapter(_FusedDslashAdapter):
+    """Multi-RHS variant: K buffers carry a singleton leading batch dim.
+
+    With ``K_*`` shaped ``(4, 1, T, Z, Y, X, ns*nc, ns*nc)``, indexing
+    ``self.K_fwd_re[mu]`` yields ``(1, T, Z, Y, X, ns*nc, ns*nc)`` which
+    broadcasts against a batched flat psi of shape
+    ``(B, T, Z, Y, X, ns*nc)`` in the einsum.
+    """
+
+    def __init__(
+        self,
+        K_fwd_re: torch.Tensor, K_fwd_im: torch.Tensor,
+        K_bwd_re: torch.Tensor, K_bwd_im: torch.Tensor,
+        diag: float, ns: int, nc: int,
+    ) -> None:
+        # Insert a singleton batch dim AFTER the leading mu axis.
+        super().__init__(
+            K_fwd_re.unsqueeze(1), K_fwd_im.unsqueeze(1),
+            K_bwd_re.unsqueeze(1), K_bwd_im.unsqueeze(1),
+            diag=diag, ns=ns, nc=nc,
+        )
+
+
+class _FusedDslashWrapper(nn.Module):
+    """Host-side shim around a compiled fused single-RHS adapter.
+
+    Preserves the ``forward(psi, U=None)`` signature of the previous
+    baked-gauge wrapper so existing callers and solvers keep working.
+    The *U* argument is accepted but ignored — the gauge information is
+    already encoded in the compiled NEFF.
+    """
+
+    def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
+        super().__init__()
+        self._real_module = real_module
+        self._compute_dtype = compute_dtype
+
+    @torch.inference_mode()
+    def forward(self, psi: torch.Tensor, U: torch.Tensor = None) -> torch.Tensor:
+        dt = self._compute_dtype
+        r_re, r_im = self._real_module(
+            psi.real.to(dt).contiguous(),
+            psi.imag.to(dt).contiguous(),
+        )
+        return torch.complex(r_re.float(), r_im.float())
+
+
+class _FusedBatchedDslashWrapper(nn.Module):
+    """Host-side shim around a compiled fused multi-RHS adapter."""
+
+    def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
+        super().__init__()
+        self._real_module = real_module
+        self._compute_dtype = compute_dtype
+
+    @torch.inference_mode()
+    def forward(self, psi: torch.Tensor) -> torch.Tensor:
+        dt = self._compute_dtype
+        r_re, r_im = self._real_module(
+            psi.real.to(dt).contiguous(),
+            psi.imag.to(dt).contiguous(),
+        )
+        return torch.complex(r_re.float(), r_im.float())
+
+
 class NeuronCompiler:
     """Compile ``nn.Module`` operators for execution on Neuron hardware.
 
@@ -430,16 +633,27 @@ class NeuronCompiler:
         cpu = torch.device("cpu")
 
         if gauge_field is not None:
-            # Bake the gauge field into the compiled model as NeuronCore-
-            # resident buffers.  Only the spinor crosses PCIe per call.
-            U_re = gauge_field.real.to(dt).contiguous()
-            U_im = gauge_field.imag.to(dt).contiguous()
-            baked = _BakedGaugeAdapter(adapter, U_re, U_im).to(dt)
+            # Bake the gauge field into the compiled model as fused per-site,
+            # per-direction (Ns*Nc)×(Ns*Nc) hopping kernels.  At runtime each
+            # call only does a roll + one large matvec per direction-side; the
+            # backward-U rolls and the spin/colour einsum split are absorbed
+            # into the precomputed buffers.  Only the spinor crosses PCIe.
+            if isinstance(dslash_module, WilsonDirac):
+                diag = 4.0 + dslash_module.mass
+            else:
+                diag = 0.0
+            K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im = _build_dslash_kernels(
+                gauge_field, nc=nc, ns=ns, dtype=dt,
+            )
+            fused = _FusedDslashAdapter(
+                K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im,
+                diag=diag, ns=ns, nc=nc,
+            ).to(dt)
             psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
             psi_im = torch.zeros_like(psi_re)
             # No cache key — the NEFF embeds this specific gauge configuration.
-            compiled = self.compile(baked, (psi_re, psi_im))
-            return _BakedGaugeDslashWrapper(compiled, compute_dtype=dt)
+            compiled = self.compile(fused, (psi_re, psi_im))
+            return _FusedDslashWrapper(compiled, compute_dtype=dt)
 
         adapter = adapter.to(dt)
         psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
@@ -525,14 +739,22 @@ class NeuronCompiler:
         dt = self.torch_dtype
         cpu = torch.device("cpu")
 
-        U_re = gauge_field.real.to(dt).contiguous()
-        U_im = gauge_field.imag.to(dt).contiguous()
-        baked = _BakedGaugeBatchedAdapter(adapter, U_re, U_im).to(dt)
+        if isinstance(dslash_module, WilsonDirac):
+            diag = 4.0 + dslash_module.mass
+        else:
+            diag = 0.0
+        K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im = _build_dslash_kernels(
+            gauge_field, nc=nc, ns=ns, dtype=dt,
+        )
+        fused = _FusedBatchedDslashAdapter(
+            K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im,
+            diag=diag, ns=ns, nc=nc,
+        ).to(dt)
         psi_re = torch.zeros(batch_size, T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
         psi_im = torch.zeros_like(psi_re)
         # No cache key — the NEFF embeds this specific gauge configuration.
-        compiled = self.compile(baked, (psi_re, psi_im))
-        return _BakedGaugeBatchedDslashWrapper(compiled, compute_dtype=dt)
+        compiled = self.compile(fused, (psi_re, psi_im))
+        return _FusedBatchedDslashWrapper(compiled, compute_dtype=dt)
 
     def compile_observable(
         self,
