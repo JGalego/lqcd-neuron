@@ -28,6 +28,8 @@ RUN_BENCH=0
 USE_SSM=0
 EXTRA_SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
 
+DLAMI_VENV="/opt/aws_neuronx_venv_pytorch_2_8"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --setup)  RUN_SETUP=1; shift ;;
@@ -114,8 +116,7 @@ if [[ "${RUN_TESTS}" -eq 1 ]]; then
     echo "[connect] Running test suite on the instance …"
     $SSH <<REMOTE
 set -euo pipefail
-VENV="/opt/aws_neuronx_venv_pytorch_2_1"
-[[ -d "\${VENV}" ]] && source "\${VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
+[[ -d "\${DLAMI_VENV}" ]] && source "\${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
 cd ~/lqcd-neuron
 bash scripts/run_tests.sh ${BENCH_FLAG}
 REMOTE
