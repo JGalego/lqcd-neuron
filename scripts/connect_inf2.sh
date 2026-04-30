@@ -116,7 +116,7 @@ if [[ "${RUN_TESTS}" -eq 1 ]]; then
     echo "[connect] Running test suite on the instance …"
     $SSH <<REMOTE
 set -euo pipefail
-[[ -d "\${DLAMI_VENV}" ]] && source "\${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
+[[ -d "${DLAMI_VENV}" ]] && source "${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
 cd ~/lqcd-neuron
 bash scripts/run_tests.sh ${BENCH_FLAG}
 REMOTE
