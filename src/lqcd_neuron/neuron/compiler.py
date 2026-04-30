@@ -104,18 +104,36 @@ class _ComplexDslashWrapper(nn.Module):
     casts to the compute dtype used by the compiled kernel, and reassembles
     the result as a ``complex64`` spinor — preserving the standard
     ``forward(psi, U)`` interface expected by examples and solvers.
+
+    The gauge field *U* is typically constant across solver iterations,
+    so the split/cast result is cached and reused when the same tensor
+    is passed again.  This avoids redundant host-side dtype conversions
+    that otherwise scale with the lattice volume on every call.
     """
 
     def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
         super().__init__()
         self._real_module = real_module
         self._compute_dtype = compute_dtype
+        # Cached gauge-field conversion (avoids re-split + re-cast every call)
+        self._cached_U_ptr: Optional[int] = None
+        self._cached_U_re: Optional[torch.Tensor] = None
+        self._cached_U_im: Optional[torch.Tensor] = None
 
+    @torch.inference_mode()
     def forward(self, psi: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
         dt = self._compute_dtype
+
+        # Cache the gauge-field split+cast — U rarely changes between calls
+        u_ptr = U.data_ptr()
+        if u_ptr != self._cached_U_ptr:
+            self._cached_U_re = U.real.to(dt).contiguous()
+            self._cached_U_im = U.imag.to(dt).contiguous()
+            self._cached_U_ptr = u_ptr
+
         r_re, r_im = self._real_module(
             psi.real.to(dt).contiguous(), psi.imag.to(dt).contiguous(),
-            U.real.to(dt).contiguous(),   U.imag.to(dt).contiguous(),
+            self._cached_U_re,            self._cached_U_im,
         )
         return torch.complex(r_re.float(), r_im.float())
 
