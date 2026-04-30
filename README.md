@@ -165,6 +165,19 @@ make bench-neuron        # on an Inf2 / Trn1 instance
 make connect-bench       # SSH into the OpenTofu-provisioned instance
 ```
 
+### Profiling & monitoring
+
+For an EEG-style per-NeuronCore utilization trace over time, run:
+
+```bash
+make trace               # 30 s capture, writes traces/neuron_<ts>.{jsonl,png}
+make trace-live          # rolling-window live plot
+```
+
+See [scripts/neuron_trace.py](scripts/neuron_trace.py) &mdash; a standalone
+wrapper around `neuron-monitor` that produces stacked per-core time-series
+plots. Details in the [Quickstart](docs/quickstart.md#profiling--monitoring).
+
 
 ## Repository layout
 
@@ -182,6 +195,10 @@ lqcd-neuron/
 │   ├── 01_plaquette.py
 │   ├── 02_wilson_dslash.py
 │   └── 03_cg_inversion.py
+├── scripts/
+│   ├── setup_inf2.sh       # Bootstrap a Trn1 / Inf2 instance
+│   ├── connect_inf2.sh     # SSH helper for the provisioned instance
+│   └── neuron_trace.py     # EEG-style NeuronCore utilization tracer
 ├── tests/
 └── docs/
     ├── architecture.md   # Design overview

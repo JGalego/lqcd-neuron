@@ -63,3 +63,6 @@ infra/*.tfplan
 # Distribution / packaging
 *.tar.gz
 *.whl
+
+# neuron_trace.py output
+traces/

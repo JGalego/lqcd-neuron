@@ -69,6 +69,18 @@ bench-neuron:  ## Neuron vs CPU Dslash throughput benchmark (requires Inf2/Trn1)
 	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py --neuron
 
 # ---------------------------------------------------------------------------
+# Profiling / monitoring
+# ---------------------------------------------------------------------------
+
+.PHONY: trace
+trace:  ## Capture per-NeuronCore utilization (30 s) + PNG (requires Inf2/Trn1)
+	. $(VENV_ACTIVATE) && $(PYTHON) scripts/neuron_trace.py
+
+.PHONY: trace-live
+trace-live:  ## Live EEG-style rolling view of NeuronCore utilization
+	. $(VENV_ACTIVATE) && $(PYTHON) scripts/neuron_trace.py --live
+
+# ---------------------------------------------------------------------------
 # Code quality
 # ---------------------------------------------------------------------------
 
