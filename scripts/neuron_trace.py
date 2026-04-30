@@ -140,24 +140,15 @@ def _extract_sample(record: dict, t0: float) -> Sample | None:
                 util /= 100.0
             cores[cid] = max(0.0, min(1.0, util))
 
-    # If no runtime is loaded, detect available cores from instance info
+    # If no runtime is loaded, detect available cores from hardware info
     # and report them as idle (0%).
     if not cores:
-        instance_info = record.get("instance_info") or {}
-        neuron_devices = instance_info.get("neuron_devices") or []
-        for dev in neuron_devices:
-            nc_list = dev.get("neuron_cores") or []
-            for nc_info in nc_list:
-                cid = nc_info.get("neuroncore_index")
-                if cid is not None:
-                    cores[int(cid)] = 0.0
-
-    # Still nothing — try to infer core count from neuron_hardware field
-    if not cores:
-        hw = record.get("neuron_hardware") or {}
-        nc_count = hw.get("neuroncore_count") or hw.get("neuron_core_count", 0)
+        hw = record.get("neuron_hardware_info") or {}
+        dev_count = hw.get("neuron_device_count", 0)
+        nc_per_dev = hw.get("neuroncore_per_device_count", 0)
+        nc_count = int(dev_count) * int(nc_per_dev)
         if nc_count:
-            cores = {i: 0.0 for i in range(int(nc_count))}
+            cores = {i: 0.0 for i in range(nc_count)}
 
     if not cores:
         return None
