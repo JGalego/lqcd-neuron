@@ -324,11 +324,15 @@ def live_view(period_s: float, window_s: float) -> None:
         # Pad to trace_width with spaces on the left (empty = no data yet)
         padded = [0.0] * max(0, trace_width - len(core_history)) + core_history[-trace_width:]
         chars: list[str] = []
-        for v in padded:
+        for i, v in enumerate(padded):
             idx = int(v * 8.0 + 0.5)
             idx = max(0, min(8, idx))
             ch = _SPARK[idx]
-            if idx == 0:
+            # Show a dim baseline dot for 0% where we have data (not padding)
+            data_start = max(0, trace_width - len(core_history))
+            if idx == 0 and i >= data_start:
+                chars.append("\033[2m▁\033[0m")
+            elif idx == 0:
                 chars.append(" ")
             else:
                 chars.append(_color_for(v) + ch + reset)
