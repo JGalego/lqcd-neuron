@@ -56,6 +56,7 @@ User Python code
 |                      | `polyakov_loop`              | Spatially-averaged Polyakov loop ⟨L⟩               |
 | **Neuron utilities** | `NeuronCompiler`             | `torch_neuronx.trace` wrapper; gauge-baking + fused kernels |
 |                      | `compile_dslash_batched`     | Multi-RHS Dslash compilation for amortised dispatch |
+|                      | `compile_dslash_multicore`   | Data-parallel Dslash sharded across all NeuronCores |
 |                      | `NeuronDevice`               | Hardware detection (Trn1 / Inf2 / CPU fallback)    |
 
 
@@ -129,6 +130,15 @@ D_batched = compiler.compile_dslash_batched(
     D, lattice_shape=(8, 4, 4, 4), batch_size=8, gauge_field=U, nc=3,
 )
 out_batch = D_batched(psi_batch)   # psi_batch shape: (8, T, Z, Y, X, Ns, Nc)
+
+# Multi-core: shard a global batch of `num_cores * per_core_batch_size`
+# RHS across all detected NeuronCores via torch_neuronx.DataParallel.
+D_mc = compiler.compile_dslash_multicore(
+    D, lattice_shape=(8, 4, 4, 4), gauge_field=U,
+    num_cores=None,            # default: all detected NeuronCores
+    per_core_batch_size=8, nc=3,
+)
+out_mc = D_mc(psi_global)      # psi_global shape: (num_cores * 8, T, Z, Y, X, Ns, Nc)
 ```
 
 
@@ -157,6 +167,12 @@ Three compile-time optimisations make this possible:
    *B* spinors per call, amortising the ~1 ms per-call NeuronCore dispatch
    overhead.  This is the same pattern used by production multi-source LQCD
    propagator inverters.
+4. **Multi-core data-parallel sharding** — `compile_dslash_multicore(…)` wraps
+   the compiled `.neff` in `torch_neuronx.DataParallel`, replicating it across
+   every detected NeuronCore (e.g. all 2 cores on `inf2.xlarge`, 24 on
+   `trn1.32xlarge`).  A global batch of `num_cores * per_core_batch_size`
+   right-hand sides is split along dim 0 — combining inter-core parallelism
+   with the intra-core multi-RHS path above.
 
 Reproduce locally with:
 

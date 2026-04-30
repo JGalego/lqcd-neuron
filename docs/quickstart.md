@@ -190,6 +190,35 @@ psi_batch = torch.stack([psi.tensor for _ in range(B)], dim=0)
 out_batch = D_batched(psi_batch)
 ```
 
+### Multi-core (data-parallel) inversion
+
+On instances with more than one NeuronCore (`inf2.xlarge` has 2,
+`trn1.32xlarge` has 32), shard the batch across cores via
+`torch_neuronx.DataParallel`:
+
+```python
+from lqcd_neuron.neuron import get_device
+
+num_cores = get_device().num_cores      # auto-detected from /dev/neuron*
+per_core_batch_size = 8
+B_global = num_cores * per_core_batch_size
+
+D_mc = compiler.compile_dslash_multicore(
+    D, lattice_shape=geom.shape, gauge_field=U.tensor,
+    num_cores=num_cores,                 # default: all detected cores
+    per_core_batch_size=per_core_batch_size,
+    nc=geom.nc,
+)
+
+psi_global = torch.stack([psi.tensor for _ in range(B_global)], dim=0)
+out_global = D_mc(psi_global)            # shape: (B_global, T, Z, Y, X, Ns, Nc)
+```
+
+The gauge field is baked into each core's `.neff`, so only the spinor
+shard crosses PCIe per core per call.  This stacks with multi-RHS
+batching: each core still runs the fused 12×12 batched kernel on its
+`per_core_batch_size` slice.
+
 > **Note:** the `.neff` produced by the gauge-baked path is specific to the
 > exact gauge configuration passed in.  Re-compile (cheap once warm) when `U`
 > changes between solves.

@@ -223,6 +223,25 @@ the NeuronCore tensor engine can saturate.  This pattern matches production
 multi-source LQCD propagator inverters, which already solve for one RHS per
 source spin×colour combination.
 
+### 4. Multi-core data-parallel sharding
+
+`compile_dslash_multicore(D, shape, gauge_field=U, num_cores=N,
+per_core_batch_size=B)` wraps the per-core `.neff` in
+`torch_neuronx.DataParallel`, replicating the model on each of the *N*
+detected NeuronCores (defaulting to `NeuronDevice.num_cores`).  At call
+time a global batch of `N * B` right-hand sides is split along dim 0 by
+the runtime, so each core executes its baked, fused, multi-RHS NEFF on
+its local slice in parallel.
+
+This composes with the previous three optimisations rather than
+replacing them: gauge baking and fused kernels apply per core, the
+multi-RHS batch fills each core's tensor engine, and the data-parallel
+shard multiplies that by the number of cores on the instance (2 on
+`inf2.xlarge`, up to 24 on `trn1.32xlarge`).  The host-side
+`_MultiCoreDslashWrapper` validates the global batch size and otherwise
+presents the same `forward(psi)` signature as the single-core batched
+path.
+
 ### Verifying correctness
 
 The fused kernels are bit-equivalent to `WilsonDirac.forward()` up to
