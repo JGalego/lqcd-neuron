@@ -119,6 +119,7 @@ def _extract_sample(record: dict, t0: float) -> Sample | None:
     for rt in runtimes:
         report = rt.get("report") or {}
         nc = report.get("neuroncore_counters") or {}
+        # Try neuroncores_in_use first, fall back to per_core list
         per_core = nc.get("neuroncores_in_use") or {}
         for core_id_str, info in per_core.items():
             try:
@@ -138,6 +139,25 @@ def _extract_sample(record: dict, t0: float) -> Sample | None:
             if util > 1.5:
                 util /= 100.0
             cores[cid] = max(0.0, min(1.0, util))
+
+    # If no runtime is loaded, detect available cores from instance info
+    # and report them as idle (0%).
+    if not cores:
+        instance_info = record.get("instance_info") or {}
+        neuron_devices = instance_info.get("neuron_devices") or []
+        for dev in neuron_devices:
+            nc_list = dev.get("neuron_cores") or []
+            for nc_info in nc_list:
+                cid = nc_info.get("neuroncore_index")
+                if cid is not None:
+                    cores[int(cid)] = 0.0
+
+    # Still nothing — try to infer core count from neuron_hardware field
+    if not cores:
+        hw = record.get("neuron_hardware") or {}
+        nc_count = hw.get("neuroncore_count") or hw.get("neuron_core_count", 0)
+        if nc_count:
+            cores = {i: 0.0 for i in range(int(nc_count))}
 
     if not cores:
         return None
@@ -360,6 +380,7 @@ def live_view(period_s: float, window_s: float) -> None:
     rendered_lines = 0
 
     print("[neuron_trace] live terminal mode — Ctrl-C to stop\n", file=sys.stderr)
+    records_seen = 0
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -370,8 +391,15 @@ def live_view(period_s: float, window_s: float) -> None:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            records_seen += 1
             s = _extract_sample(rec, t0)
             if s is None:
+                if records_seen <= 3:
+                    print(
+                        f"[neuron_trace] record #{records_seen}: no cores detected "
+                        f"(keys: {list(rec.keys())[:6]})",
+                        file=sys.stderr,
+                    )
                 continue
             samples.append(s)
 
