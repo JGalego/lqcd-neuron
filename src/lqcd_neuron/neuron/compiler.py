@@ -138,6 +138,53 @@ class _ComplexDslashWrapper(nn.Module):
         return torch.complex(r_re.float(), r_im.float())
 
 
+class _BakedGaugeAdapter(nn.Module):
+    """Wraps a Dslash adapter with the gauge field stored as on-device buffers.
+
+    When compiled with ``torch_neuronx.trace``, model buffers live on the
+    NeuronCore, so only the spinor field is transferred over PCIe per call.
+    """
+
+    def __init__(
+        self,
+        adapter: nn.Module,
+        U_re: torch.Tensor,
+        U_im: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.adapter = adapter
+        self.register_buffer("U_re", U_re)
+        self.register_buffer("U_im", U_im)
+
+    def forward(
+        self, psi_re: torch.Tensor, psi_im: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.adapter(psi_re, psi_im, self.U_re, self.U_im)
+
+
+class _BakedGaugeDslashWrapper(nn.Module):
+    """Host-side shim for Dslash with gauge field baked into the compiled model.
+
+    Accepts the standard ``forward(psi, U)`` signature for API compatibility
+    but ignores *U* — the gauge field is already on the NeuronCore.
+    Only the spinor is split and transferred per call.
+    """
+
+    def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
+        super().__init__()
+        self._real_module = real_module
+        self._compute_dtype = compute_dtype
+
+    @torch.inference_mode()
+    def forward(self, psi: torch.Tensor, U: torch.Tensor = None) -> torch.Tensor:
+        dt = self._compute_dtype
+        r_re, r_im = self._real_module(
+            psi.real.to(dt).contiguous(),
+            psi.imag.to(dt).contiguous(),
+        )
+        return torch.complex(r_re.float(), r_im.float())
+
+
 class NeuronCompiler:
     """Compile ``nn.Module`` operators for execution on Neuron hardware.
 
@@ -269,6 +316,7 @@ class NeuronCompiler:
         lattice_shape: Tuple[int, int, int, int],
         nc: int = 3,
         ns: int = 4,
+        gauge_field: Optional[torch.Tensor] = None,
     ) -> nn.Module:
         """Compile a Dslash / Dirac operator for a fixed lattice shape.
 
@@ -286,9 +334,16 @@ class NeuronCompiler:
             lattice_shape: ``(T, Z, Y, X)`` lattice extents.
             nc:            Number of colours.
             ns:            Number of spin components.
+            gauge_field:   Optional gauge tensor ``(T, Z, Y, X, 4, Nc, Nc)``
+                           of ``complex64``.  When provided the gauge field is
+                           baked into the compiled model as NeuronCore-resident
+                           buffers so only the spinor crosses PCIe per call.
+                           Recommended for benchmarks and iterative solvers
+                           where *U* stays constant.
 
         Returns:
             Module with ``forward(psi, U)`` accepting ``complex64`` tensors.
+            When *gauge_field* was provided, *U* is accepted but ignored.
         """
         from ..dirac.wilson import (
             WilsonDirac,
@@ -323,6 +378,19 @@ class NeuronCompiler:
         # enqueued but never flushed to NeuronCores without an explicit
         # xm.mark_step() call — the root cause of 0% neuron-top utilisation.
         cpu = torch.device("cpu")
+
+        if gauge_field is not None:
+            # Bake the gauge field into the compiled model as NeuronCore-
+            # resident buffers.  Only the spinor crosses PCIe per call.
+            U_re = gauge_field.real.to(dt).contiguous()
+            U_im = gauge_field.imag.to(dt).contiguous()
+            baked = _BakedGaugeAdapter(adapter, U_re, U_im).to(dt)
+            psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+            psi_im = torch.zeros_like(psi_re)
+            # No cache key — the NEFF embeds this specific gauge configuration.
+            compiled = self.compile(baked, (psi_re, psi_im))
+            return _BakedGaugeDslashWrapper(compiled, compute_dtype=dt)
+
         adapter = adapter.to(dt)
         psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
         psi_im = torch.zeros_like(psi_re)

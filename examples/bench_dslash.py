@@ -39,9 +39,9 @@ LATTICE_SIZES: List[Tuple[int, int, int, int]] = [
     (8, 4, 4, 4),
     (8, 8, 4, 4),
     (8, 8, 8, 4),
-    (16, 8, 8, 8),
-    (16, 16, 16, 16),
-    (32, 16, 16, 16),
+    #(16, 8, 8, 8),
+    #(16, 16, 16, 16),
+    #(32, 16, 16, 16),
 ]
 
 WARMUP_ITERS = 5
@@ -57,15 +57,16 @@ def benchmark_one(
     label: str = "",
 ) -> float:
     """Return applications/second for ``matvec(psi, U)``."""
-    for _ in range(warmup):
-        _ = matvec(psi, U)
+    with torch.inference_mode():
+        for _ in range(warmup):
+            _ = matvec(psi, U)
 
-    torch.cuda.synchronize() if psi.is_cuda else None
+        torch.cuda.synchronize() if psi.is_cuda else None
 
-    t0 = time.perf_counter()
-    for _ in range(n):
-        out = matvec(psi, U)
-    elapsed = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        for _ in range(n):
+            out = matvec(psi, U)
+        elapsed = time.perf_counter() - t0
     return n / elapsed
 
 
@@ -100,7 +101,7 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
         if use_neuron:
             # AoT compile (first call is slow; result cached to disk)
             print(f"{row:>16}  compiling for Neuron …", end="\r", flush=True)
-            D_n = compiler.compile_dslash(D, shape, nc=nc)
+            D_n = compiler.compile_dslash(D, shape, nc=nc, gauge_field=U)
             neuron_aps = benchmark_one(D_n, psi, U, label="Neuron")
             speedup    = neuron_aps / cpu_aps
             line += f"  {neuron_aps:>16.1f}  {speedup:>7.1f}x"
