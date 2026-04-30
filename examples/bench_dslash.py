@@ -27,7 +27,7 @@ import torch
 
 from lqcd_neuron.core import ColorSpinorField, GaugeField, LatticeGeometry
 from lqcd_neuron.dirac import WilsonDirac
-from lqcd_neuron.neuron import NeuronCompiler, is_neuron_available
+from lqcd_neuron.neuron import NeuronCompiler, get_device, is_neuron_available
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +105,14 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
         use_neuron = False
 
     compiler = NeuronCompiler(dtype="bfloat16") if use_neuron else None
+    num_cores = get_device().num_cores if use_neuron else 1
 
     if use_neuron:
+        mc_label = f"Multicore x{num_cores} (apps/s)"
         header = (f"{'Lattice':>16}  {'CPU (apps/s)':>14}  "
                   f"{'Neuron (apps/s)':>16}  "
-                  f"{f'Neuron x{BATCH_SIZE} (apps/s)':>22}  {'Speedup':>8}")
+                  f"{f'Neuron x{BATCH_SIZE} (apps/s)':>22}  "
+                  f"{mc_label:>{len(mc_label)}}  {'Speedup':>8}")
         ruler  = "-" * len(header)
     else:
         header = f"{'Lattice':>16}  {'CPU (apps/s)':>14}"
@@ -136,7 +139,7 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
             D_n = compiler.compile_dslash(D, shape, nc=nc, gauge_field=U)
             neuron_aps = benchmark_one(D_n, psi, U, label="Neuron")
 
-            # Multi-RHS Neuron path
+            # Multi-RHS Neuron path (single core)
             print(f"{row:>16}  compiling batched (B={BATCH_SIZE}) …",
                   end="\r", flush=True)
             D_b = compiler.compile_dslash_batched(
@@ -145,8 +148,21 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
             psi_batch = psi.unsqueeze(0).expand(BATCH_SIZE, *psi.shape).contiguous()
             batched_aps = benchmark_batched(D_b, psi_batch)
 
-            speedup = batched_aps / cpu_aps
+            # Multi-core data-parallel path
+            mc_aps = 0.0
+            if num_cores > 1:
+                mc_batch = num_cores * BATCH_SIZE
+                print(f"{row:>16}  compiling multicore ({num_cores} cores) …",
+                      end="\r", flush=True)
+                D_mc = compiler.compile_dslash_multicore(
+                    D, shape, gauge_field=U, num_cores=num_cores, nc=nc
+                )
+                psi_mc = psi.unsqueeze(0).expand(mc_batch, *psi.shape).contiguous()
+                mc_aps = benchmark_batched(D_mc, psi_mc)
+
+            speedup = (mc_aps if mc_aps > 0 else batched_aps) / cpu_aps
             line += (f"  {neuron_aps:>16.1f}  {batched_aps:>22.1f}  "
+                     f"{mc_aps:>{len(mc_label)}.1f}  "
                      f"{speedup:>7.1f}x")
 
         print(line)

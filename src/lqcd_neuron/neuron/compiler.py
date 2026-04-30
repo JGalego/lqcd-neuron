@@ -438,6 +438,39 @@ class _FusedBatchedDslashWrapper(nn.Module):
         return torch.complex(r_re.float(), r_im.float())
 
 
+class _MultiCoreDslashWrapper(nn.Module):
+    """Host-side shim for multi-core data-parallel Dslash execution.
+
+    Splits a batched complex64 spinor across *num_cores* NeuronCores,
+    runs each slice through the DataParallel-wrapped compiled model,
+    and reassembles the results.
+
+    ``forward(psi)`` accepts ``(B, T, Z, Y, X, Ns, Nc)`` where B must
+    be divisible by *num_cores*.
+    """
+
+    def __init__(
+        self,
+        parallel_module: nn.Module,
+        compute_dtype: torch.dtype = torch.float32,
+        num_cores: int = 1,
+    ) -> None:
+        super().__init__()
+        self._parallel_module = parallel_module
+        self._compute_dtype = compute_dtype
+        self.num_cores = num_cores
+
+    @torch.inference_mode()
+    def forward(self, psi: torch.Tensor) -> torch.Tensor:
+        dt = self._compute_dtype
+        # DataParallel splits dim 0 across cores automatically
+        r_re, r_im = self._parallel_module(
+            psi.real.to(dt).contiguous(),
+            psi.imag.to(dt).contiguous(),
+        )
+        return torch.complex(r_re.float(), r_im.float())
+
+
 class NeuronCompiler:
     """Compile ``nn.Module`` operators for execution on Neuron hardware.
 
@@ -827,6 +860,142 @@ class NeuronCompiler:
         key = f"plaquette_{lattice_shape}_{nc}_{dt}"
         compiled = self.compile(adapter, (U_re, U_im), cache_key=key)
         return _ComplexInputWrapper(compiled, compute_dtype=dt)
+
+    # ------------------------------------------------------------------
+    # Multi-core data-parallel compilation
+    # ------------------------------------------------------------------
+
+    def compile_multicore(
+        self,
+        model: nn.Module,
+        example_inputs: Tuple[torch.Tensor, ...],
+        num_cores: Optional[int] = None,
+        cache_key: Optional[str] = None,
+    ) -> nn.Module:
+        """Compile *model* and replicate across multiple NeuronCores.
+
+        Uses ``torch_neuronx.DataParallel`` to distribute input batches
+        across *num_cores* NeuronCores.  Each core receives an equal slice
+        of the leading (batch) dimension.
+
+        On non-Neuron hardware, returns the original model unchanged.
+
+        Args:
+            model:          The ``nn.Module`` to compile.
+            example_inputs: Tuple of example input tensors (single-core shapes).
+            num_cores:      Number of NeuronCores to use.  Defaults to all
+                            detected cores (``NeuronDevice.num_cores``).
+            cache_key:      Optional string key for the in-process cache.
+
+        Returns:
+            A DataParallel-wrapped compiled module that splits input dim 0
+            across *num_cores* NeuronCores.
+        """
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — returning PyTorch CPU module."
+            )
+            return model
+
+        if num_cores is None:
+            num_cores = self._device.num_cores
+
+        # Compile a single-core NEFF first
+        compiled = self.compile(model, example_inputs, cache_key=cache_key)
+
+        if num_cores <= 1:
+            return compiled
+
+        try:
+            import torch_neuronx
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "torch-neuronx is required for multi-core compilation.  "
+                "Install it with: pip install torch-neuronx"
+            ) from exc
+
+        device_ids = list(range(num_cores))
+        logger.info(
+            "Wrapping compiled model with DataParallel across %d cores.",
+            num_cores,
+        )
+        return torch_neuronx.DataParallel(compiled, device_ids=device_ids, dim=0)
+
+    def compile_dslash_multicore(
+        self,
+        dslash_module: nn.Module,
+        lattice_shape: Tuple[int, int, int, int],
+        gauge_field: torch.Tensor,
+        num_cores: Optional[int] = None,
+        nc: int = 3,
+        ns: int = 4,
+    ) -> nn.Module:
+        """Compile a multi-core data-parallel Dslash operator.
+
+        Distributes batched spinors across multiple NeuronCores for maximum
+        throughput.  Each core processes ``batch_size // num_cores`` right-hand
+        sides concurrently.
+
+        The gauge field is baked into each core's compiled model, so only the
+        spinor crosses PCIe per call.
+
+        Args:
+            dslash_module:  A ``WilsonDslash`` or ``WilsonDirac`` instance.
+            lattice_shape:  ``(T, Z, Y, X)`` lattice extents.
+            gauge_field:    Gauge tensor ``(T, Z, Y, X, 4, Nc, Nc)`` complex64.
+            num_cores:      NeuronCores to use (default: all detected).
+            nc:             Number of colours.
+            ns:             Number of spin components.
+
+        Returns:
+            A :class:`_MultiCoreDslashWrapper` with ``forward(psi)`` accepting
+            a batched complex64 spinor ``(B, T, Z, Y, X, Ns, Nc)`` where
+            ``B`` must be divisible by *num_cores*.
+        """
+        from ..dirac.wilson import WilsonDirac, WilsonDslash
+
+        if num_cores is None:
+            num_cores = self._device.num_cores
+
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — returning CPU batched shim."
+            )
+
+            class _CpuMulticore(nn.Module):
+                def __init__(self, m: nn.Module, U_: torch.Tensor) -> None:
+                    super().__init__()
+                    self.m = m
+                    self.U = U_
+
+                def forward(self, psi: torch.Tensor) -> torch.Tensor:
+                    return self.m(psi, self.U)
+
+            return _CpuMulticore(dslash_module, gauge_field)
+
+        T, Z, Y, X = lattice_shape
+        dt = self.torch_dtype
+        cpu = torch.device("cpu")
+
+        if isinstance(dslash_module, WilsonDirac):
+            diag = 4.0 + dslash_module.mass
+        else:
+            diag = 0.0
+
+        K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im = _build_dslash_kernels(
+            gauge_field, nc=nc, ns=ns, dtype=dt,
+        )
+        fused = _FusedBatchedDslashAdapter(
+            K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im,
+            diag=diag, ns=ns, nc=nc,
+        ).to(dt)
+
+        # Example inputs: single RHS per core (DataParallel splits dim 0)
+        psi_re = torch.zeros(1, T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+        psi_im = torch.zeros_like(psi_re)
+
+        parallel = self.compile_multicore(fused, (psi_re, psi_im), num_cores=num_cores)
+        return _MultiCoreDslashWrapper(parallel, compute_dtype=dt, num_cores=num_cores)
 
     # ------------------------------------------------------------------
     # torch.compile backend (PyTorch 2.x alternative to trace)

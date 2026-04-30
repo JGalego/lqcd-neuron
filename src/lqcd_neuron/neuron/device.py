@@ -111,7 +111,27 @@ class NeuronDevice:
             except ImportError:
                 pass
 
-        self.num_cores = int(os.environ.get("NEURON_RT_NUM_CORES", "1"))
+        self.num_cores = self._detect_num_cores()
+
+    @staticmethod
+    def _detect_num_cores() -> int:
+        """Detect the number of NeuronCores available to this process.
+
+        Priority:
+        1. ``NEURON_RT_NUM_CORES`` environment variable (explicit override)
+        2. Count of ``/dev/neuron*`` device nodes × 2 (each chip has 2 cores)
+        3. Fallback to 1
+        """
+        env_val = os.environ.get("NEURON_RT_NUM_CORES")
+        if env_val is not None:
+            return int(env_val)
+
+        # Each /dev/neuronN device corresponds to one Neuron chip (2 cores)
+        devices = glob.glob("/dev/neuron[0-9]*")
+        if devices:
+            return len(devices) * 2
+
+        return 1
 
     @property
     def device(self) -> torch.device:
