@@ -241,10 +241,11 @@ def run(
             f"{'Lattice':>16}",
             f"{'CPU':>14}",
             f"{'Neuron':>14}",
-            f"{'Batched':>14}",
         ]
-        if show_multicore:
-            cols.append(f"{'Multicore':>14}")
+        if fused:
+            cols.append(f"{'Batched':>14}")
+            if show_multicore:
+                cols.append(f"{'Multicore':>14}")
         cols += [f"{'Speedup':>8}", f"{'GFLOP/s':>10}", f"{'GB/s':>8}"]
         header = "  ".join(cols)
         ruler  = "-" * len(header)
@@ -258,9 +259,10 @@ def run(
     print(f"    CPU       = CPU baseline, single RHS")
     if use_neuron:
         print(f"    Neuron    = 1 NeuronCore, single RHS")
-        print(f"    Batched   = 1 NeuronCore, {BATCH_SIZE} RHS per call")
-        if show_multicore:
-            print(f"    Multicore = {num_cores} NeuronCores, {BATCH_SIZE} RHS each")
+        if fused:
+            print(f"    Batched   = 1 NeuronCore, {BATCH_SIZE} RHS per call")
+            if show_multicore:
+                print(f"    Multicore = {num_cores} NeuronCores, {BATCH_SIZE} RHS each")
         print(f"    Speedup   = best Neuron / CPU")
         print(f"    GFLOP/s   = derived from best Neuron column "
               f"(1320 flops/site, Babich et al. 2011)")
@@ -287,12 +289,14 @@ def run(
         line = f"{entry['label']:>16}  {entry['cpu']:>14.1f}"
         shape = entry.get("shape")
         if use_neuron and "neuron" in entry:
-            best = entry.get("multicore") or entry["batched"]
+            best = entry.get("multicore") or entry.get("batched") or entry["neuron"]
             speedup = best / entry["cpu"]
             gflops, gbps = derived_metrics(best, shape, bf16=True)
-            line += f"  {entry['neuron']:>14.1f}  {entry['batched']:>14.1f}"
-            if show_multicore:
-                line += f"  {entry['multicore']:>14.1f}"
+            line += f"  {entry['neuron']:>14.1f}"
+            if fused:
+                line += f"  {entry.get('batched', float('nan')):>14.1f}"
+                if show_multicore:
+                    line += f"  {entry.get('multicore', float('nan')):>14.1f}"
             line += f"  {speedup:>7.1f}x  {gflops:>10.2f}  {gbps:>8.2f}"
         elif not use_neuron:
             gflops, gbps = derived_metrics(entry["cpu"], shape, bf16=False)
