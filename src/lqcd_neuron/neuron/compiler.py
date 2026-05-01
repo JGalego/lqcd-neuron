@@ -57,6 +57,40 @@ from .device import NeuronDevice, get_device, NeuronHardware
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# NeuronCore-v2 on-chip SRAM budget for the fused hopping kernels
+# ---------------------------------------------------------------------------
+# NeuronCore-v2 has 24 MiB SBUF + 2 MiB PSUM per core.  The four fused
+# K_fwd/K_bwd buffers must all reside on-chip simultaneously for the kernel
+# matvec to run at peak throughput.  Once they spill to HBM the operator
+# becomes bandwidth-bound, which explains the measured speedup cliff:
+#
+#   V =  2 048 (8×8×8×4):  buffers ~9.4 MiB  → fits, 6.4× speedup
+#   V =  8 192 (16×8×8×8): buffers ~37.7 MiB → spills, 2.2× speedup
+#
+# We budget 60% of SBUF for the kernels, leaving headroom for the spinor
+# input/output and PSUM accumulate buffers.  compile_dslash auto-falls back
+# to the unfused baked-gauge path when the fused buffers exceed this budget.
+# Override with NeuronCompiler(sram_threshold_bytes=N).
+
+_NC2_SRAM_BYTES = 24 * 1024 * 1024   # 24 MiB NeuronCore-v2 SBUF
+_FUSED_SRAM_BUDGET = 0.60             # fraction of SBUF reserved for kernels
+
+
+def _fused_kernel_bytes(
+    lattice_shape: Tuple[int, int, int, int],
+    ns: int = 4,
+    nc: int = 3,
+    dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    """Return bytes occupied by the four K_fwd/K_bwd fused-kernel buffers."""
+    V = 1
+    for d in lattice_shape:
+        V *= d
+    elem_bytes = 2 if dtype == torch.bfloat16 else 4
+    # 4 tensors (re/im × fwd/bwd) × 4 directions × V sites × (Ns×Nc)² elements
+    return 4 * 4 * V * (ns * nc) ** 2 * elem_bytes
+
 
 class _NeuronPlaquetteAdapter(nn.Module):
     """Pure float32 plaquette kernel for Neuron.
@@ -174,14 +208,22 @@ class _BakedGaugeDslashWrapper(nn.Module):
         super().__init__()
         self._real_module = real_module
         self._compute_dtype = compute_dtype
+        # Pre-allocated spinor scratch buffers; lazily initialised on first
+        # call so the wrapper can be constructed before any input is seen.
+        # Avoids a per-call malloc + dtype cast that scales with lattice volume.
+        self._buf_re: Optional[torch.Tensor] = None
+        self._buf_im: Optional[torch.Tensor] = None
 
     @torch.inference_mode()
     def forward(self, psi: torch.Tensor, U: torch.Tensor = None) -> torch.Tensor:
         dt = self._compute_dtype
-        r_re, r_im = self._real_module(
-            psi.real.to(dt).contiguous(),
-            psi.imag.to(dt).contiguous(),
-        )
+        real_shape = psi.real.shape
+        if self._buf_re is None or self._buf_re.shape != real_shape:
+            self._buf_re = torch.empty(real_shape, dtype=dt)
+            self._buf_im = torch.empty(real_shape, dtype=dt)
+        self._buf_re.copy_(psi.real)
+        self._buf_im.copy_(psi.imag)
+        r_re, r_im = self._real_module(self._buf_re, self._buf_im)
         return torch.complex(r_re.float(), r_im.float())
 
 
@@ -409,14 +451,19 @@ class _FusedDslashWrapper(nn.Module):
         super().__init__()
         self._real_module = real_module
         self._compute_dtype = compute_dtype
+        self._buf_re: Optional[torch.Tensor] = None
+        self._buf_im: Optional[torch.Tensor] = None
 
     @torch.inference_mode()
     def forward(self, psi: torch.Tensor, U: torch.Tensor = None) -> torch.Tensor:
         dt = self._compute_dtype
-        r_re, r_im = self._real_module(
-            psi.real.to(dt).contiguous(),
-            psi.imag.to(dt).contiguous(),
-        )
+        real_shape = psi.real.shape
+        if self._buf_re is None or self._buf_re.shape != real_shape:
+            self._buf_re = torch.empty(real_shape, dtype=dt)
+            self._buf_im = torch.empty(real_shape, dtype=dt)
+        self._buf_re.copy_(psi.real)
+        self._buf_im.copy_(psi.imag)
+        r_re, r_im = self._real_module(self._buf_re, self._buf_im)
         return torch.complex(r_re.float(), r_im.float())
 
 
@@ -427,14 +474,19 @@ class _FusedBatchedDslashWrapper(nn.Module):
         super().__init__()
         self._real_module = real_module
         self._compute_dtype = compute_dtype
+        self._buf_re: Optional[torch.Tensor] = None
+        self._buf_im: Optional[torch.Tensor] = None
 
     @torch.inference_mode()
     def forward(self, psi: torch.Tensor) -> torch.Tensor:
         dt = self._compute_dtype
-        r_re, r_im = self._real_module(
-            psi.real.to(dt).contiguous(),
-            psi.imag.to(dt).contiguous(),
-        )
+        real_shape = psi.real.shape
+        if self._buf_re is None or self._buf_re.shape != real_shape:
+            self._buf_re = torch.empty(real_shape, dtype=dt)
+            self._buf_im = torch.empty(real_shape, dtype=dt)
+        self._buf_re.copy_(psi.real)
+        self._buf_im.copy_(psi.imag)
+        r_re, r_im = self._real_module(self._buf_re, self._buf_im)
         return torch.complex(r_re.float(), r_im.float())
 
 
@@ -462,6 +514,8 @@ class _MultiCoreDslashWrapper(nn.Module):
         self.num_cores = num_cores
         self.per_core_batch_size = per_core_batch_size
         self.global_batch_size = num_cores * per_core_batch_size
+        self._buf_re: Optional[torch.Tensor] = None
+        self._buf_im: Optional[torch.Tensor] = None
 
     @torch.inference_mode()
     def forward(self, psi: torch.Tensor) -> torch.Tensor:
@@ -473,11 +527,316 @@ class _MultiCoreDslashWrapper(nn.Module):
                 f"{self.global_batch_size}"
             )
         dt = self._compute_dtype
+        real_shape = psi.real.shape
+        if self._buf_re is None or self._buf_re.shape != real_shape:
+            self._buf_re = torch.empty(real_shape, dtype=dt)
+            self._buf_im = torch.empty(real_shape, dtype=dt)
+        self._buf_re.copy_(psi.real)
+        self._buf_im.copy_(psi.imag)
         # DataParallel splits dim 0 across cores automatically
-        r_re, r_im = self._parallel_module(
-            psi.real.to(dt).contiguous(),
-            psi.imag.to(dt).contiguous(),
-        )
+        r_re, r_im = self._parallel_module(self._buf_re, self._buf_im)
+        self._buf_im.copy_(psi.imag)
+        # DataParallel splits dim 0 across cores automatically
+        r_re, r_im = self._parallel_module(self._buf_re, self._buf_im)
+        return torch.complex(r_re.float(), r_im.float())
+
+
+# ---------------------------------------------------------------------------
+# Even-odd (checkerboard) preconditioning — half-lattice fused kernels
+# ---------------------------------------------------------------------------
+#
+# The lattice is split into two V/2-site sublattices by parity:
+#   even (p=0): (t+z+y+x) % 2 == 0
+#   odd  (p=1): (t+z+y+x) % 2 == 1
+#
+# Each nearest-neighbour hop connects even ↔ odd sites, so the Dslash matrix
+# is block off-diagonal in the (even, odd) basis:
+#
+#   D_hop = [ 0     D_eo ]
+#            [ D_oe  0   ]
+#
+# Compiling D_oe and D_eo separately instead of the full D_hop halves the
+# fused-kernel buffer footprint (V/2 sites instead of V), deferring the
+# SRAM-spill cliff by one lattice doubling:
+#
+#   16×8×8×8 full  (~37.7 MiB) → spills SRAM (2.2× speedup measured)
+#   16×8×8×8 half  (~18.9 MiB) → fits  in SRAM (expected ~6× speedup)
+#
+# Storage format
+# --------------
+# Half-lattice spinors / gauge fields are packed as (T, Z, Y, X//2, ...).
+# For parity p at row (t, z, y), the x-coordinate of half-lattice index ix is:
+#   x = 2*ix + (t+z+y+p) % 2
+#
+# Utility functions
+# -----------------
+#   pack_checkerboard(psi_full, parity)  → (T, Z, Y, X//2, Ns, Nc)
+#   unpack_checkerboard(psi_half, parity, T, Z, Y, X) → (T, Z, Y, X, Ns, Nc)
+# ---------------------------------------------------------------------------
+
+
+def pack_checkerboard(psi_full: torch.Tensor, parity: int) -> torch.Tensor:
+    """Pack a full-lattice spinor into half-lattice (T, Z, Y, X//2, Ns, Nc).
+
+    Args:
+        psi_full: Complex spinor of shape ``(T, Z, Y, X, Ns, Nc)``.
+        parity:   0 for even sites ``(t+z+y+x)%2==0``,  1 for odd.
+
+    Returns:
+        Half-lattice spinor of shape ``(T, Z, Y, X//2, Ns, Nc)``.
+    """
+    T, Z, Y, X = psi_full.shape[:4]
+    assert X % 2 == 0, "X must be even for even-odd decomposition"
+    t = torch.arange(T, device=psi_full.device).view(T, 1, 1, 1)
+    z = torch.arange(Z, device=psi_full.device).view(1, Z, 1, 1)
+    y = torch.arange(Y, device=psi_full.device).view(1, 1, Y, 1)
+    ix = torch.arange(X // 2, device=psi_full.device).view(1, 1, 1, X // 2)
+    x = (2 * ix + (t + z + y + parity) % 2).expand(T, Z, Y, X // 2)
+    return psi_full[
+        t.expand(T, Z, Y, X // 2),
+        z.expand(T, Z, Y, X // 2),
+        y.expand(T, Z, Y, X // 2),
+        x,
+    ]
+
+
+def unpack_checkerboard(
+    psi_half: torch.Tensor,
+    parity: int,
+    T: int,
+    Z: int,
+    Y: int,
+    X: int,
+) -> torch.Tensor:
+    """Unpack a half-lattice spinor back to full-lattice shape.
+
+    Args:
+        psi_half: Half-lattice spinor ``(T, Z, Y, X//2, Ns, Nc)``.
+        parity:   0 (even) or 1 (odd).
+        T, Z, Y, X: Full-lattice extents.
+
+    Returns:
+        ``(T, Z, Y, X, Ns, Nc)`` with zeros on the complementary parity sites.
+    """
+    Ns, Nc = psi_half.shape[-2], psi_half.shape[-1]
+    psi_full = torch.zeros(
+        T, Z, Y, X, Ns, Nc, dtype=psi_half.dtype, device=psi_half.device
+    )
+    t = torch.arange(T, device=psi_half.device).view(T, 1, 1, 1)
+    z = torch.arange(Z, device=psi_half.device).view(1, Z, 1, 1)
+    y = torch.arange(Y, device=psi_half.device).view(1, 1, Y, 1)
+    ix = torch.arange(X // 2, device=psi_half.device).view(1, 1, 1, X // 2)
+    x = (2 * ix + (t + z + y + parity) % 2).expand(T, Z, Y, X // 2)
+    psi_full[
+        t.expand(T, Z, Y, X // 2),
+        z.expand(T, Z, Y, X // 2),
+        y.expand(T, Z, Y, X // 2),
+        x,
+    ] = psi_half
+    return psi_full
+
+
+def _build_dslash_kernels_halfvol(
+    U: torch.Tensor,
+    out_parity: int,
+    *,
+    nc: int,
+    ns: int,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pre-compute fused spin-color hopping kernels for a half-lattice.
+
+    Only kernels at *out_parity* output sites are built (shape
+    ``(4, T, Z, Y, X//2, ns*nc, ns*nc)``), halving on-chip memory vs the
+    full-lattice ``_build_dslash_kernels``.
+
+    Args:
+        U:          Full-lattice gauge field ``(T, Z, Y, X, 4, Nc, Nc)`` (complex64).
+        out_parity: Parity of **output** sites (0 = even, 1 = odd).
+        nc, ns:     Colour and spin counts.
+        dtype:      Element dtype of the returned tensors (e.g. bfloat16).
+
+    Returns:
+        ``(K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im)`` each of shape
+        ``(4, T, Z, Y, X//2, ns*nc, ns*nc)`` and dtype *dtype*.
+    """
+    from ..dirac.gamma import degrand_rossi_gammas
+
+    T, Z, Y, X = U.shape[:4]
+    assert X % 2 == 0
+    Uc = U.to(torch.complex64)
+
+    G  = degrand_rossi_gammas(dtype=torch.complex64)
+    I4 = torch.eye(4, dtype=torch.complex64)
+    P_minus = [I4 - G[mu] for mu in range(4)]
+    P_plus  = [I4 + G[mu] for mu in range(4)]
+
+    # Coordinates of out_parity sites in the half-lattice --------------------
+    t_idx = torch.arange(T).view(T, 1, 1, 1)
+    z_idx = torch.arange(Z).view(1, Z, 1, 1)
+    y_idx = torch.arange(Y).view(1, 1, Y, 1)
+    ix    = torch.arange(X // 2).view(1, 1, 1, X // 2)
+    x_out = (2 * ix + (t_idx + z_idx + y_idx + out_parity) % 2).expand(T, Z, Y, X // 2)
+
+    T_e = t_idx.expand(T, Z, Y, X // 2)
+    Z_e = z_idx.expand(T, Z, Y, X // 2)
+    Y_e = y_idx.expand(T, Z, Y, X // 2)
+
+    K_fwd = torch.zeros(4, T, Z, Y, X // 2, ns * nc, ns * nc, dtype=torch.complex64)
+    K_bwd = torch.zeros_like(K_fwd)
+
+    for mu in range(4):
+        # U at the output site itself (for K_fwd = P_minus ⊗ U)
+        U_mu_out = Uc[T_e, Z_e, Y_e, x_out, mu, :, :]  # (T,Z,Y,X//2,Nc,Nc)
+
+        # U at the backward neighbour x_out - μ̂ (for K_bwd = P_plus ⊗ U†)
+        if mu == 0:
+            U_mu_bwd = Uc[(T_e - 1) % T, Z_e, Y_e, x_out, mu, :, :]
+        elif mu == 1:
+            U_mu_bwd = Uc[T_e, (Z_e - 1) % Z, Y_e, x_out, mu, :, :]
+        elif mu == 2:
+            U_mu_bwd = Uc[T_e, Z_e, (Y_e - 1) % Y, x_out, mu, :, :]
+        else:  # mu == 3 (X)
+            U_mu_bwd = Uc[T_e, Z_e, Y_e, (x_out - 1) % X, mu, :, :]
+
+        K_fwd[mu] = torch.einsum(
+            "ab,...ij->...aibj", P_minus[mu], U_mu_out
+        ).reshape(T, Z, Y, X // 2, ns * nc, ns * nc)
+        K_bwd[mu] = torch.einsum(
+            "ab,...ij->...aibj", P_plus[mu], U_mu_bwd.conj().transpose(-1, -2)
+        ).reshape(T, Z, Y, X // 2, ns * nc, ns * nc)
+
+    return (
+        K_fwd.real.to(dtype).contiguous(),
+        K_fwd.imag.to(dtype).contiguous(),
+        K_bwd.real.to(dtype).contiguous(),
+        K_bwd.imag.to(dtype).contiguous(),
+    )
+
+
+class _HalfLatticeHopAdapter(nn.Module):
+    """Wilson hop on a half-lattice (T, Z, Y, X//2, Ns, Nc) spinors.
+
+    Applies D_{out_parity ← in_parity} using V/2-site fused kernels.
+    T/Z/Y hops use standard ``torch.roll``; the X hop uses a staggered
+    roll that is selected per (t, z, y) row via pre-baked boolean masks,
+    keeping the forward pass Python-control-flow-free for ``torch_neuronx``
+    tracing.
+
+    Args:
+        K_fwd_re/im: Forward kernels ``(4, T, Z, Y, X//2, ns*nc, ns*nc)``.
+        K_bwd_re/im: Backward kernels (same shape).
+        diag:        Diagonal coefficient (4+mass for Dirac, 0 for Dslash).
+        ns, nc:      Spin / colour counts.
+        out_parity:  Parity of output sites (0 or 1); determines X roll logic.
+    """
+
+    def __init__(
+        self,
+        K_fwd_re: torch.Tensor, K_fwd_im: torch.Tensor,
+        K_bwd_re: torch.Tensor, K_bwd_im: torch.Tensor,
+        diag: float, ns: int, nc: int,
+        out_parity: int,
+        lattice_shape: Tuple[int, int, int, int],
+    ) -> None:
+        super().__init__()
+        self.register_buffer("K_fwd_re", K_fwd_re)
+        self.register_buffer("K_fwd_im", K_fwd_im)
+        self.register_buffer("K_bwd_re", K_bwd_re)
+        self.register_buffer("K_bwd_im", K_bwd_im)
+        self.diag = float(diag)
+        self.ns = ns
+        self.nc = nc
+
+        # Pre-bake boolean masks for the staggered X-direction roll.
+        # r_mask[t,z,y] = (t+z+y+out_parity) % 2
+        # X fwd roll: apply roll(-1) when r_mask == 1  (i.e. in_parity=0 rows)
+        # X bwd roll: apply roll(+1) when r_mask == 0
+        T, Z, Y, X = lattice_shape
+        t_idx = torch.arange(T).view(T, 1, 1, 1, 1)
+        z_idx = torch.arange(Z).view(1, Z, 1, 1, 1)
+        y_idx = torch.arange(Y).view(1, 1, Y, 1, 1)
+        r = (t_idx + z_idx + y_idx + out_parity) % 2  # (T,Z,Y,1,1)
+        # Expand over X//2 and Ns*Nc dims so torch.where broadcasts cleanly.
+        r_expanded = r.expand(T, Z, Y, X // 2, ns * nc)
+        self.register_buffer("_r_mask_fwd", (r_expanded == 1))   # bool
+        self.register_buffer("_r_mask_bwd", (r_expanded == 0))   # bool
+
+    def forward(
+        self,
+        psi_re: torch.Tensor,
+        psi_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Flatten spin×colour (last two dims) into Ns*Nc.
+        pr = psi_re.flatten(-2)   # (T, Z, Y, X//2, Ns*Nc)
+        pi = psi_im.flatten(-2)
+
+        out_re = self.diag * pr
+        out_im = self.diag * pi
+
+        for mu in range(4):
+            Kfr, Kfi = self.K_fwd_re[mu], self.K_fwd_im[mu]
+            Kbr, Kbi = self.K_bwd_re[mu], self.K_bwd_im[mu]
+
+            # Lattice axes T,Z,Y,X//2 sit at dims -5..-2 of the flat tensor.
+            ldim = mu - 5
+
+            if mu < 3:
+                # T / Z / Y: nearest neighbours are always on the complementary
+                # parity and at the same ix coordinate → plain roll.
+                pf_re = torch.roll(pr, -1, dims=ldim)
+                pf_im = torch.roll(pi, -1, dims=ldim)
+                pb_re = torch.roll(pr,  1, dims=ldim)
+                pb_im = torch.roll(pi,  1, dims=ldim)
+            else:
+                # X (mu=3): roll amount depends on row parity (t+z+y+p)%2.
+                # fwd: roll -1 when r==1, else no roll.
+                # bwd: roll +1 when r==0, else no roll.
+                pf_re = torch.where(self._r_mask_fwd, torch.roll(pr, -1, dims=ldim), pr)
+                pf_im = torch.where(self._r_mask_fwd, torch.roll(pi, -1, dims=ldim), pi)
+                pb_re = torch.where(self._r_mask_bwd, torch.roll(pr,  1, dims=ldim), pr)
+                pb_im = torch.where(self._r_mask_bwd, torch.roll(pi,  1, dims=ldim), pi)
+
+            cf_re = (torch.einsum("...ij,...j->...i", Kfr, pf_re)
+                   - torch.einsum("...ij,...j->...i", Kfi, pf_im))
+            cf_im = (torch.einsum("...ij,...j->...i", Kfr, pf_im)
+                   + torch.einsum("...ij,...j->...i", Kfi, pf_re))
+            cb_re = (torch.einsum("...ij,...j->...i", Kbr, pb_re)
+                   - torch.einsum("...ij,...j->...i", Kbi, pb_im))
+            cb_im = (torch.einsum("...ij,...j->...i", Kbr, pb_im)
+                   + torch.einsum("...ij,...j->...i", Kbi, pb_re))
+
+            out_re = out_re - 0.5 * (cf_re + cb_re)
+            out_im = out_im - 0.5 * (cf_im + cb_im)
+
+        return out_re.unflatten(-1, (self.ns, self.nc)), out_im.unflatten(-1, (self.ns, self.nc))
+
+
+class _HalfLatticeDslashWrapper(nn.Module):
+    """Host-side shim around a compiled half-lattice hop adapter.
+
+    Accepts and returns **half-lattice** complex64 spinors of shape
+    ``(T, Z, Y, X//2, Ns, Nc)``.  Use :func:`pack_checkerboard` /
+    :func:`unpack_checkerboard` to convert to/from full-lattice tensors.
+    """
+
+    def __init__(self, real_module: nn.Module, compute_dtype: torch.dtype = torch.float32) -> None:
+        super().__init__()
+        self._real_module = real_module
+        self._compute_dtype = compute_dtype
+        self._buf_re: Optional[torch.Tensor] = None
+        self._buf_im: Optional[torch.Tensor] = None
+
+    @torch.inference_mode()
+    def forward(self, psi_half: torch.Tensor) -> torch.Tensor:
+        dt = self._compute_dtype
+        real_shape = psi_half.real.shape
+        if self._buf_re is None or self._buf_re.shape != real_shape:
+            self._buf_re = torch.empty(real_shape, dtype=dt)
+            self._buf_im = torch.empty(real_shape, dtype=dt)
+        self._buf_re.copy_(psi_half.real)
+        self._buf_im.copy_(psi_half.imag)
+        r_re, r_im = self._real_module(self._buf_re, self._buf_im)
         return torch.complex(r_re.float(), r_im.float())
 
 
@@ -499,11 +858,15 @@ class NeuronCompiler:
         dtype: str = "float32",
         optimize_level: int = 2,
         device: Optional[NeuronDevice] = None,
+        sram_threshold_bytes: Optional[int] = None,
     ) -> None:
         self.dtype = dtype
         self.optimize_level = optimize_level
         self._device = device or get_device()
         self._cache: Dict[Tuple, Any] = {}
+        # Override the auto-detected SRAM budget for the fused-kernel fallback.
+        # None means use the default fraction of _NC2_SRAM_BYTES.
+        self.sram_threshold_bytes = sram_threshold_bytes
 
         if workdir is None:
             workdir = str(Path.home() / ".cache" / "lqcd-neuron" / "neuronx")
@@ -686,6 +1049,30 @@ class NeuronCompiler:
         cpu = torch.device("cpu")
 
         if gauge_field is not None:
+            # Auto-fallback: if the fused per-site (Ns×Nc)² kernels would
+            # overflow NeuronCore SRAM, use the unfused baked-gauge path
+            # instead.  The unfused path has ~12× smaller on-chip working set
+            # (raw gauge links vs. full spin-colour fused matrices) and
+            # outperforms the fused path once the latter causes HBM spill.
+            if fused:
+                sram_budget = (
+                    self.sram_threshold_bytes
+                    or int(_NC2_SRAM_BYTES * _FUSED_SRAM_BUDGET)
+                )
+                kb = _fused_kernel_bytes(lattice_shape, ns=ns, nc=nc, dtype=dt)
+                if kb > sram_budget:
+                    logger.warning(
+                        "compile_dslash: fused kernels (%.1f MiB) exceed SRAM "
+                        "budget (%.1f MiB) for lattice %s — auto-falling back "
+                        "to unfused baked-gauge path. "
+                        "Override with NeuronCompiler(sram_threshold_bytes=N) "
+                        "or pass fused=False explicitly.",
+                        kb / 1024**2,
+                        sram_budget / 1024**2,
+                        lattice_shape,
+                    )
+                    fused = False
+
             if not fused:
                 # Bake the gauge field as raw (T,Z,Y,X,4,Nc,Nc) buffers but
                 # keep the spin/colour einsums in the traced graph.  Working
@@ -824,6 +1211,88 @@ class NeuronCompiler:
         # No cache key — the NEFF embeds this specific gauge configuration.
         compiled = self.compile(fused, (psi_re, psi_im))
         return _FusedBatchedDslashWrapper(compiled, compute_dtype=dt)
+
+    def compile_dslash_eo(
+        self,
+        dslash_module: nn.Module,
+        lattice_shape: Tuple[int, int, int, int],
+        out_parity: int,
+        gauge_field: torch.Tensor,
+        nc: int = 3,
+        ns: int = 4,
+    ) -> nn.Module:
+        """Compile a half-lattice even-odd Wilson hop D_{out ← in}.
+
+        Builds fused hopping kernels only at *out_parity* output sites
+        (V/2 sites instead of V), halving the NeuronCore on-chip working
+        set.  This defers the SRAM-spill cliff by one lattice doubling:
+
+        - ``16×8×8×8`` full-lattice fused kernels: ~37.7 MiB (spills SRAM)
+        - ``16×8×8×8`` half-lattice fused kernels: ~18.9 MiB (fits in SRAM)
+
+        The returned module accepts and returns **half-lattice** complex64
+        spinors of shape ``(T, Z, Y, X//2, Ns, Nc)``.  Use
+        :func:`pack_checkerboard` / :func:`unpack_checkerboard` to convert
+        between full-lattice and half-lattice representations.
+
+        Args:
+            dslash_module: ``WilsonDslash`` or ``WilsonDirac`` instance
+                           (only the ``mass`` attribute is used for the
+                           diagonal; the actual graph is replaced by the
+                           fused adapter).
+            lattice_shape: ``(T, Z, Y, X)`` full-lattice extents.
+                           *X* must be even.
+            out_parity:    Parity of output sites: 0 (even) or 1 (odd).
+                           ``out_parity=1`` gives D_oe (odd output, even
+                           input); ``out_parity=0`` gives D_eo.
+            gauge_field:   Full-lattice gauge tensor
+                           ``(T, Z, Y, X, 4, Nc, Nc)`` of ``complex64``.
+                           The gauge field is pre-processed at compile time
+                           and baked into the NEFF.
+            nc:            Number of colours.
+            ns:            Number of spin components.
+
+        Returns:
+            Module with ``forward(psi_half)`` accepting a complex64
+            half-lattice spinor ``(T, Z, Y, X//2, Ns, Nc)``.
+        """
+        from ..dirac.wilson import WilsonDirac, WilsonDslash
+
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — returning CPU even-odd shim."
+            )
+            from ..dirac.wilson import EvenOddWilsonDslash
+
+            is_dirac = isinstance(dslash_module, WilsonDirac)
+            mass = dslash_module.mass if is_dirac else 0.0
+            return EvenOddWilsonDslash(
+                mass=mass, nc=nc, dtype=torch.complex64
+            ).hop(out_parity)
+
+        T, Z, Y, X = lattice_shape
+        assert X % 2 == 0, "X must be even for even-odd decomposition"
+        dt = self.torch_dtype
+        cpu = torch.device("cpu")
+
+        if isinstance(dslash_module, WilsonDirac):
+            diag = 4.0 + dslash_module.mass
+        else:
+            diag = 0.0
+
+        K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im = _build_dslash_kernels_halfvol(
+            gauge_field, out_parity=out_parity, nc=nc, ns=ns, dtype=dt,
+        )
+        adapter = _HalfLatticeHopAdapter(
+            K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im,
+            diag=diag, ns=ns, nc=nc,
+            out_parity=out_parity,
+            lattice_shape=lattice_shape,
+        ).to(dt)
+        psi_re = torch.zeros(T, Z, Y, X // 2, ns, nc, dtype=dt, device=cpu)
+        psi_im = torch.zeros_like(psi_re)
+        compiled = self.compile(adapter, (psi_re, psi_im))
+        return _HalfLatticeDslashWrapper(compiled, compute_dtype=dt)
 
     def compile_observable(
         self,

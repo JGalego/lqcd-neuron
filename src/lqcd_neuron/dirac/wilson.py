@@ -300,6 +300,125 @@ class _NeuronWilsonDslashAdapter(nn.Module):
         return result_re, result_im
 
 
+# ---------------------------------------------------------------------------
+# Even-odd (checkerboard) Wilson hop — CPU reference implementation
+# ---------------------------------------------------------------------------
+
+class EvenOddWilsonDslash(nn.Module):
+    r"""Even-odd decomposition of the Wilson hopping operator.
+
+    The full lattice is split into two V/2-site sublattices:
+        even (p=0): (t+z+y+x) % 2 == 0
+        odd  (p=1): (t+z+y+x) % 2 == 1
+
+    The nearest-neighbour hop connects even ↔ odd sites exclusively, so::
+
+        D_hop = [ 0     D_eo ]
+                [ D_oe  0   ]
+
+    This module provides :meth:`hop_oe` and :meth:`hop_eo` on **full-lattice**
+    spinors and gauge fields (shape ``(T, Z, Y, X, Ns, Nc)`` and
+    ``(T, Z, Y, X, 4, Nc, Nc)`` respectively).  Each method applies the
+    hopping term only at the *output* parity sites and zeros the other half.
+
+    For Neuron half-lattice compilation (which halves on-chip memory), use
+    :meth:`NeuronCompiler.compile_dslash_eo` together with
+    :func:`~lqcd_neuron.neuron.compiler.pack_checkerboard` /
+    :func:`~lqcd_neuron.neuron.compiler.unpack_checkerboard`.
+
+    Args:
+        mass:  Bare quark mass.  Used only for the diagonal in the full Dirac
+               form ``M = (4+m)I + D_hop``.  Pass 0.0 for the bare hop.
+        nc:    Number of colours.
+        dtype: Complex dtype for internal gamma-matrix buffers.
+    """
+
+    def __init__(
+        self,
+        mass: float = 0.0,
+        nc: int = 3,
+        dtype: torch.dtype = torch.complex64,
+    ) -> None:
+        super().__init__()
+        self.mass = mass
+        self.nc = nc
+
+        G  = degrand_rossi_gammas(dtype=dtype)
+        I4 = torch.eye(4, dtype=dtype)
+        P_minus = torch.stack([I4 - G[mu] for mu in range(4)], dim=0)
+        P_plus  = torch.stack([I4 + G[mu] for mu in range(4)], dim=0)
+        self.register_buffer("P_minus", P_minus)
+        self.register_buffer("P_plus",  P_plus)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parity_mask(
+        T: int, Z: int, Y: int, X: int, parity: int, device: torch.device
+    ) -> torch.Tensor:
+        """Boolean mask of shape (T, Z, Y, X) — True at *parity* sites."""
+        t = torch.arange(T, device=device).view(T, 1, 1, 1)
+        z = torch.arange(Z, device=device).view(1, Z, 1, 1)
+        y = torch.arange(Y, device=device).view(1, 1, Y, 1)
+        x = torch.arange(X, device=device).view(1, 1, 1, X)
+        return ((t + z + y + x) % 2) == parity
+
+    def _hop(
+        self,
+        psi: torch.Tensor,
+        U: torch.Tensor,
+        in_parity: int,
+        out_parity: int,
+    ) -> torch.Tensor:
+        """Apply the hopping term: output at *out_parity*, input at *in_parity*.
+
+        Equivalent to zeroing psi at out-parity sites before the hop and
+        zeroing the result at in-parity sites after.
+        """
+        T, Z, Y, X = psi.shape[:4]
+        diag = (4.0 + self.mass) if out_parity == in_parity else 0.0
+        result = diag * psi
+
+        # Mask to zero out input on the wrong parity sites.
+        in_mask = self._parity_mask(T, Z, Y, X, in_parity, psi.device)
+        psi_in = psi * in_mask.view(T, Z, Y, X, 1, 1).to(psi.dtype)
+
+        for mu in range(4):
+            U_mu = U[..., mu, :, :]
+            # Forward hop
+            psi_fwd = torch.roll(psi_in, -1, dims=mu - 6)
+            Upsi_fwd = torch.einsum("...ij,...sj->...si", U_mu, psi_fwd)
+            contrib_fwd = torch.einsum("ij,...jk->...ik", self.P_minus[mu], Upsi_fwd)
+            # Backward hop
+            psi_bwd = torch.roll(psi_in,  1, dims=mu - 6)
+            U_mu_bwd = torch.roll(U_mu, 1, dims=mu - 6)
+            Upsi_bwd = torch.einsum("...ji,...sj->...si", U_mu_bwd.conj(), psi_bwd)
+            contrib_bwd = torch.einsum("ij,...jk->...ik", self.P_plus[mu],  Upsi_bwd)
+            result = result - 0.5 * (contrib_fwd + contrib_bwd)
+
+        # Zero the result at in-parity sites (output only at out_parity).
+        out_mask = self._parity_mask(T, Z, Y, X, out_parity, psi.device)
+        return result * out_mask.view(T, Z, Y, X, 1, 1).to(psi.dtype)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def hop_oe(self, psi: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
+        """D_oe ψ: output at **odd** sites, input from **even** sites."""
+        return self._hop(psi, U, in_parity=0, out_parity=1)
+
+    def hop_eo(self, psi: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
+        """D_eo ψ: output at **even** sites, input from **odd** sites."""
+        return self._hop(psi, U, in_parity=1, out_parity=0)
+
+    def forward(self, psi: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
+        """Full D_hop = D_oe + D_eo (all sites).  Equivalent to WilsonDslash."""
+        return self.hop_oe(psi, U) + self.hop_eo(psi, U)
+
+
 class _NeuronWilsonDiracAdapter(nn.Module):
     """Pure float32 Wilson Dirac operator M = (4+m)I + D_hop for Neuron.
 

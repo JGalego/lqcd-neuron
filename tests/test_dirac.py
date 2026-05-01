@@ -7,6 +7,7 @@ from lqcd_neuron.core import ColorSpinorField, GaugeField, LatticeGeometry
 from lqcd_neuron.dirac import (
     WilsonDirac,
     WilsonDslash,
+    EvenOddWilsonDslash,
     degrand_rossi_gammas,
     gamma5,
     sigma_munu,
@@ -16,6 +17,7 @@ from lqcd_neuron.dirac.wilson import (
     _NeuronWilsonDslashAdapter,
     _NeuronWilsonDiracAdapter,
 )
+from lqcd_neuron.neuron.compiler import pack_checkerboard, unpack_checkerboard
 
 
 DTYPE = torch.complex64
@@ -272,3 +274,150 @@ class TestNeuronRealArithmetic:
                 U_cold.real.contiguous(), U_cold.imag.contiguous(),
             )
             assert torch.allclose(torch.complex(r_re, r_im), ref, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+# Even-odd (checkerboard) decomposition
+# ---------------------------------------------------------------------------
+
+class TestEvenOdd:
+    """Verify EvenOddWilsonDslash and checkerboard pack/unpack utilities."""
+
+    @pytest.fixture
+    def geom_eo(self):
+        # Use a lattice with even X for the even-odd tests.
+        return LatticeGeometry(T=4, Z=4, Y=4, X=4)
+
+    @pytest.fixture
+    def U_eo(self, geom_eo):
+        return GaugeField.random(geom_eo, seed=7).tensor
+
+    @pytest.fixture
+    def psi_eo(self, geom_eo):
+        return ColorSpinorField.gaussian(geom_eo, seed=3, dtype=DTYPE).tensor
+
+    # ------------------------------------------------------------------
+    # Pack / unpack round-trips
+    # ------------------------------------------------------------------
+
+    def test_pack_unpack_even_roundtrip(self, geom_eo, psi_eo):
+        T, Z, Y, X = geom_eo.T, geom_eo.Z, geom_eo.Y, geom_eo.X
+        psi_half = pack_checkerboard(psi_eo, parity=0)
+        assert psi_half.shape == (T, Z, Y, X // 2, 4, geom_eo.nc)
+        psi_back = unpack_checkerboard(psi_half, parity=0, T=T, Z=Z, Y=Y, X=X)
+        # The unpacked tensor should match psi_eo at even sites and be 0 at odd.
+        t = torch.arange(T).view(T, 1, 1, 1)
+        z = torch.arange(Z).view(1, Z, 1, 1)
+        y = torch.arange(Y).view(1, 1, Y, 1)
+        x = torch.arange(X).view(1, 1, 1, X)
+        even_mask = ((t + z + y + x) % 2 == 0).unsqueeze(-1).unsqueeze(-1)
+        assert torch.allclose(psi_back[even_mask.expand_as(psi_back)],
+                               psi_eo[even_mask.expand_as(psi_eo)])
+        assert psi_back[~even_mask.expand_as(psi_back)].abs().max() == 0
+
+    def test_pack_unpack_odd_roundtrip(self, geom_eo, psi_eo):
+        T, Z, Y, X = geom_eo.T, geom_eo.Z, geom_eo.Y, geom_eo.X
+        psi_half = pack_checkerboard(psi_eo, parity=1)
+        psi_back = unpack_checkerboard(psi_half, parity=1, T=T, Z=Z, Y=Y, X=X)
+        t = torch.arange(T).view(T, 1, 1, 1)
+        z = torch.arange(Z).view(1, Z, 1, 1)
+        y = torch.arange(Y).view(1, 1, Y, 1)
+        x = torch.arange(X).view(1, 1, 1, X)
+        odd_mask = ((t + z + y + x) % 2 == 1).unsqueeze(-1).unsqueeze(-1)
+        assert torch.allclose(psi_back[odd_mask.expand_as(psi_back)],
+                               psi_eo[odd_mask.expand_as(psi_eo)])
+
+    # ------------------------------------------------------------------
+    # Consistency: D_oe + D_eo == full WilsonDslash
+    # ------------------------------------------------------------------
+
+    def test_eo_sum_equals_full_hop(self, geom_eo, U_eo, psi_eo):
+        nc = geom_eo.nc
+        D_full = WilsonDslash(nc=nc, dtype=DTYPE)
+        D_eo   = EvenOddWilsonDslash(mass=0.0, nc=nc, dtype=DTYPE)
+
+        ref = D_full(psi_eo, U_eo)
+        eo  = D_eo.hop_eo(psi_eo, U_eo) + D_eo.hop_oe(psi_eo, U_eo)
+        assert torch.allclose(eo, ref, atol=ATOL), \
+            f"D_oe + D_eo max diff = {(eo - ref).abs().max():.3e}"
+
+    def test_eo_forward_equals_full_hop(self, geom_eo, U_eo, psi_eo):
+        nc = geom_eo.nc
+        D_full = WilsonDslash(nc=nc, dtype=DTYPE)
+        D_eo   = EvenOddWilsonDslash(mass=0.0, nc=nc, dtype=DTYPE)
+        ref = D_full(psi_eo, U_eo)
+        assert torch.allclose(D_eo(psi_eo, U_eo), ref, atol=ATOL)
+
+    # ------------------------------------------------------------------
+    # Output-only at correct parity sites
+    # ------------------------------------------------------------------
+
+    def test_hop_oe_output_at_odd_sites_only(self, geom_eo, U_eo, psi_eo):
+        nc = geom_eo.nc
+        T, Z, Y, X = geom_eo.T, geom_eo.Z, geom_eo.Y, geom_eo.X
+        D_eo = EvenOddWilsonDslash(mass=0.0, nc=nc, dtype=DTYPE)
+        out  = D_eo.hop_oe(psi_eo, U_eo)
+        t = torch.arange(T).view(T, 1, 1, 1)
+        z = torch.arange(Z).view(1, Z, 1, 1)
+        y = torch.arange(Y).view(1, 1, Y, 1)
+        x = torch.arange(X).view(1, 1, 1, X)
+        even_mask = ((t + z + y + x) % 2 == 0).unsqueeze(-1).unsqueeze(-1)
+        assert out[even_mask.expand_as(out)].abs().max() == 0, \
+            "hop_oe should produce zeros at even sites"
+
+    def test_hop_eo_output_at_even_sites_only(self, geom_eo, U_eo, psi_eo):
+        nc = geom_eo.nc
+        T, Z, Y, X = geom_eo.T, geom_eo.Z, geom_eo.Y, geom_eo.X
+        D_eo = EvenOddWilsonDslash(mass=0.0, nc=nc, dtype=DTYPE)
+        out  = D_eo.hop_eo(psi_eo, U_eo)
+        t = torch.arange(T).view(T, 1, 1, 1)
+        z = torch.arange(Z).view(1, Z, 1, 1)
+        y = torch.arange(Y).view(1, 1, Y, 1)
+        x = torch.arange(X).view(1, 1, 1, X)
+        odd_mask = ((t + z + y + x) % 2 == 1).unsqueeze(-1).unsqueeze(-1)
+        assert out[odd_mask.expand_as(out)].abs().max() == 0, \
+            "hop_eo should produce zeros at odd sites"
+
+    # ------------------------------------------------------------------
+    # Half-lattice kernel consistency
+    # ------------------------------------------------------------------
+
+    def test_halfvol_kernels_match_full(self, geom_eo, U_eo, psi_eo):
+        """Half-lattice fused kernel hop should agree with EvenOddWilsonDslash."""
+        from lqcd_neuron.neuron.compiler import _build_dslash_kernels_halfvol, _HalfLatticeHopAdapter
+
+        nc = geom_eo.nc
+        ns = 4
+        T, Z, Y, X = geom_eo.T, geom_eo.Z, geom_eo.Y, geom_eo.X
+        shape = (T, Z, Y, X)
+
+        for out_parity in (0, 1):
+            in_parity = 1 - out_parity
+            D_eo_ref = EvenOddWilsonDslash(mass=0.0, nc=nc, dtype=DTYPE)
+            if out_parity == 1:
+                ref_full = D_eo_ref.hop_oe(psi_eo, U_eo)
+            else:
+                ref_full = D_eo_ref.hop_eo(psi_eo, U_eo)
+
+            # Pack input into half-lattice
+            psi_in_half = pack_checkerboard(psi_eo, in_parity)
+
+            # Build and run the half-lattice fused kernel adapter
+            K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im = _build_dslash_kernels_halfvol(
+                U_eo, out_parity=out_parity, nc=nc, ns=ns, dtype=torch.float32,
+            )
+            adapter = _HalfLatticeHopAdapter(
+                K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im,
+                diag=0.0, ns=ns, nc=nc,
+                out_parity=out_parity,
+                lattice_shape=shape,
+            )
+            out_re, out_im = adapter(psi_in_half.real, psi_in_half.imag)
+            out_half = torch.complex(out_re.float(), out_im.float())
+
+            # Unpack back to full lattice for comparison
+            out_full = unpack_checkerboard(out_half, out_parity, T, Z, Y, X)
+            assert torch.allclose(out_full, ref_full, atol=ATOL), (
+                f"out_parity={out_parity}: half-lattice kernel max diff "
+                f"= {(out_full - ref_full).abs().max():.3e}"
+            )
