@@ -1,0 +1,447 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{titling}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{slashed}
+
+\setlength{\droptitle}{-3em}
+\pretitle{\begin{center}\LARGE\bfseries}
+\posttitle{\par\end{center}\vskip 0.4em}
+\preauthor{\begin{center}\large}
+\postauthor{\par\end{center}}
+\predate{\begin{center}\small}
+\postdate{\par\end{center}}
+
+% Section titles: "<num>. <TITLE IN UPPERCASE>", no bold, centred
+\titleformat{\section}[block]
+  {\normalfont\normalsize\centering}{\thesection.}{0.5em}{\MakeUppercase}
+\titleformat{\subsection}[block]
+  {\normalfont\normalsize\itshape\centering}{\thesubsection.}{0.5em}{}
+\titleformat{name=\section,numberless}[block]
+  {\normalfont\normalsize\centering}{}{0pt}{\MakeUppercase}
+
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
+
+\setlength{\emergencystretch}{3em}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  language=Python,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{gray},
+}
+
+\newcommand{\Dslash}{\slashed{D}}
+\newcommand{\NEFF}{\texttt{.neff}}
+\newcommand{\PyT}{\textsc{PyTorch}}
+\newcommand{\NeuronX}{\textsc{Neuron}}
+
+\title{LQCD-Neuron: Compiling Lattice QCD Kernels\\
+       to AWS Trainium and Inferentia via PyTorch--XLA}
+
+\author{Jo\~ao Galego\\
+\small Independent Researcher\\
+\small \texttt{jgalego1990@gmail.com}}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{center}
+  \begin{minipage}{0.85\textwidth}
+    \begin{center}\bfseries Abstract\end{center}
+    \small
+We present \textsc{LQCD-Neuron}, a Python library that runs Wilson- and
+Clover-Wilson Lattice QCD on AWS Trainium (Trn1) and Inferentia (Inf2)
+accelerators. The hardware exposes no general-purpose compute API
+(no CUDA, HIP, or OpenCL); the only programming model is to compile a
+PyTorch / XLA graph ahead of time with \texttt{neuronx-cc} and execute
+the resulting NeuronCore Executable File Format (\NEFF) binary. We
+re-express every hot-path lattice kernel - the Wilson Dslash, the
+clover term, BLAS-1 reductions, and CG/BiCGStab solvers - as a pure
+\texttt{torch.nn.Module}, and rely on three compile-time
+transformations (gauge baking, fused $12{\times}12$ spin--colour
+matvecs, multi-RHS batching) plus a host-side data-parallel shard
+across all on-chip NeuronCores. On a single-core Inf2 NeuronCore-v2
+in BF16 we obtain up to $10.9\times$ throughput over a tuned FP32 CPU
+baseline for the Wilson Dslash on $V=4{\times}4{\times}4{\times}4$, and demonstrate that the
+optimised path remains competitive at $V=8{\times}8{\times}8{\times}4$ with no
+custom kernel code. Source code is available at
+\href{https://github.com/JGalego/lqcd-neuron}{github.com/JGalego/lqcd-neuron}
+under the Apache 2.0 license.
+  \end{minipage}
+\end{center}
+\vspace{1.5em}
+
+
+\section{Introduction}
+\label{sec:intro}
+
+The cost of a Lattice QCD simulation on heterogeneous hardware is
+dominated by repeated applications of the discretised Dirac operator
+$D$ to a quark spinor field $\psi$. In the Wilson
+formulation~\cite{Wilson:1974sk},
+\begin{equation}
+(D_W \psi)_x = (4+m)\,\psi_x - \tfrac{1}{2}\sum_{\mu=0}^{3}\!\Big[
+  (I-\gamma_\mu)\,U(x,\mu)\,\psi_{x+\hat\mu}
+  + (I+\gamma_\mu)\,U^{\dagger}(x{-}\hat\mu,\mu)\,\psi_{x-\hat\mu}\Big],
+\label{eq:wilson}
+\end{equation}
+with gauge links $U(x,\mu)\!\in\!\mathrm{SU}(3)$ and Dirac matrices
+$\gamma_\mu$ acting on the four-component spinor. A single application
+performs $\mathcal{O}(V)$ tiny dense $3{\times}3$ and $4{\times}4$
+contractions, and a Krylov inversion invokes it tens of thousands of
+times. On NVIDIA GPUs the standard tool is
+\textsc{QUDA}~\cite{Clark:2009wm,Babich:2011np}: hand-written CUDA
+kernels, dynamic shapes, runtime auto-tuning, and a multigrid
+preconditioner~\cite{Brower:2018kgy}. We ask whether comparable
+performance is reachable on AWS-designed ML accelerators --- Trainium
+(Trn1) and Inferentia (Inf2) --- which expose a fundamentally
+different programming model.
+
+Each NeuronCore-v2 is a purpose-built matrix engine. It offers no
+general-purpose compute API, no user-controlled shared memory, and no
+runtime kernel launch. Code reaches the hardware along a single path:
+a PyTorch (or JAX) computation graph is lowered ahead of time to
+XLA HLO~\cite{xla}, the \texttt{neuronx-cc} compiler emits a
+\NEFF\ binary, and the Neuron runtime executes it on the NeuronCores.
+Tensor shapes must be static at compile time, and the auto-tuning and
+runtime kernel re-launch on which QUDA relies are simply not available.
+Trainium has been shown to scale deep-learning
+training~\cite{aws-trainium}, but to our knowledge has not previously
+been targeted for first-principles Lattice QCD.
+
+The central question of this work is therefore: \emph{is the
+AoT-compiled, static-graph, matrix-engine programming model
+expressive enough for production Lattice QCD primitives, and
+competitive in throughput once the graph is shaped to fit the
+hardware?} We give an affirmative answer for the Wilson and
+Clover-Wilson Dslash and the iterative solvers built on them, with
+four composable graph-level optimisations that bring throughput from
+below CPU at modest volumes to up to $10.9\times$ above it on a single
+NeuronCore.
+
+\section{Design and architecture}
+\label{sec:arch}
+
+\paragraph*{Pure-tensor kernels.}
+Every primitive in \textsc{LQCD-Neuron} is a standard
+\texttt{torch.nn.Module} operating on dense complex tensors with a
+$(T,Z,Y,X,\dots)$ storage order. Gauge links live in
+$U\in\mathbb{C}^{T\times Z\times Y\times X\times 4\times N_c\times N_c}$
+and spinors in $\psi\in\mathbb{C}^{T\times Z\times Y\times X\times N_s\times N_c}$,
+with $N_c=3,\ N_s=4$. Lattice shifts $\psi_{x\pm\hat\mu}$ are
+realised by \texttt{torch.roll} with the appropriate axis index, which
+the Neuron compiler lowers to in-place data movement on chip. Since
+\texttt{neuronx-cc} forbids data-dependent control flow, the
+Python loop over the four directions in
+Eq.~\eqref{eq:wilson} is statically unrolled at trace time, producing
+a pure DAG that the compiler can schedule.
+
+\paragraph*{Gamma matrices.}
+The Euclidean Dirac matrices are stored in the DeGrand--Rossi (chiral)
+basis~\cite{DeGrandRossi} and registered as non-trainable
+\texttt{nn.Module} buffers, so they migrate with the module to
+NeuronCore memory under \texttt{torch\_neuronx.trace} and remain
+visible to the tracer.
+
+\paragraph*{Host loop / device kernel split.}
+Iterative solvers need a convergence test on a scalar reduction at
+every iteration, but \texttt{neuronx-cc} only supports static graphs.
+We adopt the standard deep-learning split: the Krylov loop runs on the
+host (CPU) and only the matvec $D\psi$ is compiled to NeuronCore.
+For Conjugate Gradient~\cite{HestenesStiefel}, schematically:
+\begin{lstlisting}
+for k in range(maxiter):
+    Ap    = D_neuron(p, U)        # NeuronCore
+    alpha = rho / inner(p, Ap)    # host
+    x    += alpha * p
+    r    -= alpha * Ap
+    if norm(r) < tol: break
+\end{lstlisting}
+The host overhead per iteration is $\mathcal{O}(V)$ and is dwarfed by
+the matvec for any non-trivial lattice; we verified this empirically
+against an all-on-host reference.
+
+\paragraph*{CPU fallback.}
+Because every kernel is a plain \PyT\ module, the same code runs
+identically on a laptop without Neuron hardware. The full unit-test
+suite executes on CPU, allowing development and CI without an Inf2
+instance.
+
+\section{Compile-time optimisations}
+\label{sec:opt}
+
+A naive trace of Eq.~\eqref{eq:wilson} is dominated by overheads that
+are absent on a CPU baseline:
+(i) the gauge field, $\sim\!3{\times}$ the spinor in size, crosses
+PCIe on every call;
+(ii) the per-direction kernel is two tiny einsums (a $3{\times}3$
+colour multiply and a $4{\times}4$ spin multiply), neither of which
+saturates the NeuronCore tensor engine;
+(iii) eight \texttt{torch.roll}s per call (four for $\psi$, four for
+$U^{\dagger}(x{-}\hat\mu)$) are pure data movement; and
+(iv) every NeuronCore call pays a fixed dispatch cost
+($\sim\!1\,$ms), independent of problem size. We address these in
+four composable steps.
+
+\subsection{Gauge baking}
+
+When a gauge configuration $U$ is supplied at compile time, we register
+it as an \texttt{nn.Module} buffer of the traced module rather than as
+a graph input. After \texttt{torch\_neuronx.trace}, the resulting
+\NEFF\ contains $U$ in NeuronCore-resident memory. At inference time,
+only $\psi$ crosses PCIe; the wrapper accepts a $U$ argument for API
+compatibility but ignores it. The trade-off is that the \NEFF\ is
+specific to a particular $U$, so it is not reused across different
+gauge configurations - the right choice for a single inversion or a
+chain of solves on one configuration, the wrong choice for HMC.
+
+\subsection{Fused spin--colour kernels}
+
+With $U$ baked in, the per-site, per-direction operator
+\begin{equation}
+K^{\mathrm{fwd}}_{\mu,x} = (I{-}\gamma_\mu)\!\otimes\! U(x,\mu),\ 
+K^{\mathrm{bwd}}_{\mu,x} = (I{+}\gamma_\mu)\!\otimes\! U^{\dagger}(x{-}\hat\mu,\mu)
+\end{equation}
+can be precomputed once at trace time. We materialise
+$K^{\mathrm{fwd/bwd}}_{\mu,x}\in\mathbb{C}^{N_sN_c\times N_sN_c}$ as four
+buffers of shape $(4,T,Z,Y,X,12,12)$ stored as real/imaginary float
+pairs. Each direction-side then collapses to one $12{\times}12$ matvec
+plus a single roll of $\psi$:
+\begin{lstlisting}
+psi_shifted = torch.roll(psi, sign, dim=mu)
+result     -= 0.5 * (K[mu] @ psi_shifted)
+\end{lstlisting}
+The $12{\times}12$ shape is markedly better suited to the NeuronCore
+matrix multiplication unit (MXU) than the original $3{\times}3$ /
+$4{\times}4$ einsums. The four backward rolls are absorbed into
+$K^{\mathrm{bwd}}$, halving the lattice-shift count. The fused kernel
+is bit-equivalent to the reference \texttt{forward()} up to FP32
+round-off (relative error $\lesssim 10^{-7}$), and continues to satisfy
+the existing $\gamma_5$-Hermiticity, adjoint, and normal-operator
+positivity tests.
+
+\subsection{Multi-right-hand-side batching}
+
+Production multi-source propagator inverters already solve $D\,x = b_i$
+for $N_s\!\cdot\!N_c=12$ right-hand sides per source, one per
+spin\,$\times$\,colour combination. We expose this directly:
+\texttt{compile\_dslash\_batched($D$, $\mathrm{shape}$, batch\_size=$B$,
+gauge\_field=$U$)} traces the fused operator on
+$\psi\in\mathbb{C}^{B\times T\times Z\times Y\times X\times N_s\times N_c}$.
+The baked $K$ buffers carry a singleton batch axis that broadcasts
+across all $B$ RHS, and the lattice rolls use negative-dim indexing so
+the leading batch axis is unaffected. Each direction-side becomes an
+$N_b{\times}12{\times}12$ matmul - a much better fit for the MXU's
+systolic schedule - and the fixed per-call dispatch cost is
+amortised over $B$ problems.
+
+\subsection{Multi-core data-parallel sharding}
+
+A single NeuronCore-v2 is one of $N_{\mathrm{core}}$ cores per
+accelerator chip; \texttt{inf2.xlarge} exposes 2,
+\texttt{trn1.32xlarge} 32. We replicate the compiled \NEFF\ across
+all detected cores via \texttt{torch\_neuronx.DataParallel} and
+split a global batch of $N_{\mathrm{core}}\!\cdot\! B_{\mathrm{core}}$
+RHS along dim~0:
+\begin{lstlisting}
+D_mc = compiler.compile_dslash_multicore(
+    D, shape, gauge_field=U,
+    num_cores=N, per_core_batch_size=B,
+)
+out  = D_mc(psi_global)   # B_g = N * B
+\end{lstlisting}
+This composes with the previous three optimisations rather than
+replacing them: gauge baking and fused kernels apply per core, the
+intra-core multi-RHS batch fills each core's tensor engine, and the
+data-parallel shard multiplies by $N_{\mathrm{core}}$.
+
+\section{Results}
+\label{sec:results}
+
+\begin{table}[t]
+\caption{Wilson Dslash sustained throughput on a single Inf2
+NeuronCore-v2 (BF16, gauge baked) versus a tuned CPU baseline (FP32),
+in Dslash applications per second over 50 iterations after a
+5-iteration warm-up. ``8-RHS'' uses
+\texttt{compile\_dslash\_batched} with $B{=}8$. Speed-up is the
+best Neuron column relative to CPU.}
+\label{tab:bench}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrr}
+\toprule
+Lattice & CPU & N. 1-RHS & N. 8-RHS & Speed-up \\
+\midrule
+$4{\times}4{\times}4{\times}4$               &  818 & 1419 & \textbf{8957} & $10.9\times$ \\
+$8{\times}4{\times}4{\times}4$               &  767 &  794 & \textbf{4918} &  $6.4\times$ \\
+$8{\times}8{\times}4{\times}4$               &  646 &  372 & \textbf{2481} &  $3.8\times$ \\
+$8{\times}8{\times}8{\times}4$               &  449 &  208 & \textbf{1379} &  $3.1\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:bench} reports the throughput of the optimised
+\textsc{LQCD-Neuron} Wilson Dslash on a single Inf2 NeuronCore-v2,
+compared against a CPU baseline running the same reference
+\texttt{nn.Module} in FP32. Three observations are worth noting.
+
+First, the unoptimised single-RHS Neuron column (column~3) is only
+faster than CPU at the smallest volume; at $V=8{\times}8{\times}8{\times}4$ it is
+slower by a factor of two. This confirms our hypothesis that the
+naive Dslash graph is dispatch- and shape-limited: the work per call
+is too small to amortise the $\sim\!1\,$ms NeuronCore launch cost,
+and the underlying $3{\times}3$ / $4{\times}4$ einsums leave the MXU
+idle. Second, multi-RHS batching alone closes the gap and overtakes
+CPU by $3$--$11\times$ across the lattice range, with the largest
+relative gain at small $V$ where dispatch dominates. Third, the
+relative speed-up shrinks with volume because the CPU baseline scales
+nearly linearly while the on-chip BF16 throughput is bounded by
+NeuronCore-resident memory bandwidth at this size; the multi-core
+\texttt{DataParallel} path is designed to recover scaling and is
+described above.
+
+We have additionally verified, on CPU and on a 2-core Inf2 in
+\texttt{DataParallel} mode, that the BiCGStab and CG host-loop
+solvers converge to the expected residuals on a Gaussian random
+$\psi$ with anti-periodic temporal boundaries, and that the
+gauge-baked, fused, multi-RHS \NEFF\ is invariant under permutation
+of right-hand sides to within FP32 round-off.
+
+\section{Limitations and outlook}
+\label{sec:outlook}
+
+\paragraph*{Functionality gap with QUDA.}
+The current release covers only Wilson and Clover-Wilson fermions, CG
+and BiCGStab, periodic / anti-periodic boundaries, and a small set of
+gauge observables (plaquette, Wilson action, Polyakov loop,
+clover-definition topological charge). Staggered, twisted-mass and
+domain-wall formulations~\cite{Kogut:1974ag,Frezzotti:2000nk,Kaplan:1992bt}
+are representable in the same \texttt{nn.Module} style but not yet implemented.
+Even-odd preconditioning and a multigrid preconditioner are the most
+impactful missing components; both are pure-tensor algorithms and
+present no fundamental obstacle to the \texttt{neuronx-cc} pipeline.
+
+\paragraph*{Multi-instance scaling.}
+Within a single Inf2/Trn1 instance, communication uses NeuronLink
+on-chip and \texttt{torch\_neuronx.DataParallel} as shown above. For
+multi-instance domain decomposition with halo exchange, AWS exposes
+EFA via \texttt{torch.distributed} with the NCCL-style XLA collective
+backend; integrating this with a Schwarz-style domain decomposition
+is the natural next step and is what is required to address physically
+relevant volumes ($V\!\gtrsim\!32{\times}32{\times}32{\times}32$) that exceed single-chip HBM.
+
+\paragraph*{Static shapes.}
+The most awkward limitation is the static-shape requirement: each
+$(\mathrm{class},\mathrm{shape},\mathrm{dtype},B)$ tuple compiles to a
+distinct \NEFF. For a fixed production volume this is amortised once,
+but for shape-sweeping workloads (auto-tuning, mixed-volume gauge
+ensembles) it is a real cost. \texttt{neuronx-cc} bucketing and
+shape-polymorphic XLA are partial mitigations.
+
+\paragraph*{Precision.}
+We currently run BF16 for the matvec with FP32 accumulation in the
+host-side CG/BiCGStab loop, which suffices to match the existing
+unit-test tolerances. Mixed-precision Krylov methods with iterative
+refinement~\cite{Clark:2009wm} would map cleanly onto the NeuronCore
+MXU's BF16 inputs / FP32 accumulators and are expected to recover full
+double-precision residuals at near-BF16 throughput.
+
+\section{Conclusion}
+\label{sec:concl}
+
+We have shown that the AoT-compiled, static-graph, matrix-engine
+programming model exposed by AWS Trainium and Inferentia is
+expressive enough to host the core kernels of Wilson and
+Clover-Wilson Lattice QCD, and that with four straightforward
+graph-level optimisations - gauge baking, fused $12{\times}12$
+spin--colour kernels, multi-RHS batching, and multi-core
+\texttt{DataParallel} sharding - a pure-Python library with no
+custom kernel code reaches up to $10.9\times$ over a tuned CPU
+baseline on $V=4{\times}4{\times}4{\times}4$ in BF16.
+
+\section*{Acknowledgments}
+The author thanks the AWS Neuron SDK team for documentation and
+support, and the developers of \PyT, XLA, and \textsc{QUDA} whose
+designs informed the architecture of this work.
+
+\begin{thebibliography}{99}
+
+\bibitem{Wilson:1974sk}
+K.~G.~Wilson,
+\emph{Confinement of quarks},
+Phys.\ Rev.\ D \textbf{10}, 2445 (1974).
+
+\bibitem{Clark:2009wm}
+M.~A.~Clark, R.~Babich, K.~Barros, R.~C.~Brower, and C.~Rebbi,
+\emph{Solving Lattice QCD systems of equations using mixed precision
+solvers on GPUs},
+Comput.\ Phys.\ Commun.\ \textbf{181}, 1517 (2010),
+\href{https://arxiv.org/abs/0911.3191}{arXiv:0911.3191}.
+
+\bibitem{Babich:2011np}
+R.~Babich, M.~A.~Clark, B.~Jo\'o, G.~Shi, R.~C.~Brower, and S.~Gottlieb,
+\emph{Scaling lattice QCD beyond 100 GPUs},
+SC'11 Proceedings (2011),
+\href{https://arxiv.org/abs/1109.2935}{arXiv:1109.2935}.
+
+\bibitem{Brower:2018kgy}
+R.~C.~Brower, M.~A.~Clark, A.~Strelchenko, and E.~Weinberg,
+\emph{Multigrid algorithm for staggered lattice fermions},
+Phys.\ Rev.\ D \textbf{97}, 114513 (2018),
+\href{https://arxiv.org/abs/1801.07823}{arXiv:1801.07823}.
+
+\bibitem{xla}
+The XLA Authors,
+\emph{XLA: Optimizing compiler for machine learning},
+\url{https://openxla.org/xla} (2024).
+
+\bibitem{aws-trainium}
+Amazon Web Services,
+\emph{AWS Neuron SDK Documentation},
+\url{https://awsdocs-neuron.readthedocs-hosted.com/} (2024).
+
+\bibitem{DeGrandRossi}
+T.~A.~DeGrand and D.~Toussaint, eds.,
+\emph{From Actions to Answers}, World Scientific (1990);
+see also F.~Berruto \emph{et al.}, Phys.\ Rev.\ D \textbf{73}, 014503 (2006).
+
+\bibitem{HestenesStiefel}
+M.~R.~Hestenes and E.~Stiefel,
+\emph{Methods of conjugate gradients for solving linear systems},
+J.\ Res.\ Natl.\ Bur.\ Stand.\ \textbf{49}, 409 (1952).
+
+\bibitem{Kogut:1974ag}
+J.~B.~Kogut and L.~Susskind,
+\emph{Hamiltonian formulation of Wilson's lattice gauge theories},
+Phys.\ Rev.\ D \textbf{11}, 395 (1975).
+
+\bibitem{Frezzotti:2000nk}
+R.~Frezzotti, P.~A.~Grassi, S.~Sint, and P.~Weisz,
+\emph{Lattice QCD with a chirally twisted mass term},
+JHEP \textbf{08}, 058 (2001),
+\href{https://arxiv.org/abs/hep-lat/0101001}{hep-lat/0101001}.
+
+\bibitem{Kaplan:1992bt}
+D.~B.~Kaplan,
+\emph{A method for simulating chiral fermions on the lattice},
+Phys.\ Lett.\ B \textbf{288}, 342 (1992),
+\href{https://arxiv.org/abs/hep-lat/9206013}{hep-lat/9206013}.
+
+\end{thebibliography}
+
+\end{document}
