@@ -187,23 +187,19 @@ Three compile-time optimisations make this possible:
 Reproduce locally with:
 
 ```bash
-make bench-neuron        # on an Inf2 / Trn1 instance
-make connect-bench       # SSH into the OpenTofu-provisioned instance
+make bench NEURON=1                # Neuron vs CPU Dslash benchmark
+make connect-bench NEURON=1        # SSH into the instance and run the benchmark
 ```
 
 ### Profiling & monitoring
 
-For an EEG-style per-NeuronCore utilization trace over time, run:
+Use the Neuron SDK's built-in tools directly:
 
 ```bash
-make trace               # 30 s capture, writes traces/neuron_<ts>.{jsonl,png}
-make trace-live          # rolling-window live plot
+neuron-top                         # interactive htop-style snapshot
+neuron-monitor --period 1          # JSON-stream metrics, one record/s
+neuron-profile ...                 # kernel-level timelines (view in Perfetto)
 ```
-
-See [scripts/neuron_trace.py](scripts/neuron_trace.py) &mdash; a standalone
-wrapper around `neuron-monitor` that produces stacked per-core time-series
-plots. Details in the [Quickstart](docs/quickstart.md#profiling--monitoring).
-
 
 ## Repository layout
 
@@ -223,8 +219,7 @@ lqcd-neuron/
 │   └── 03_cg_inversion.py
 ├── scripts/
 │   ├── setup_inf2.sh       # Bootstrap a Trn1 / Inf2 instance
-│   ├── connect_inf2.sh     # SSH helper for the provisioned instance
-│   └── neuron_trace.py     # EEG-style NeuronCore utilization tracer
+│   └── connect_inf2.sh     # SSH helper for the provisioned instance
 ├── tests/
 └── docs/
     ├── architecture.md   # Design overview

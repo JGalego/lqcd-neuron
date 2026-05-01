@@ -239,31 +239,19 @@ All tests run on CPU without Neuron hardware.
 
 The Neuron SDK ships two stock observability tools:
 
-- `neuron-top` &mdash; interactive `htop`-style snapshot of NeuronCore usage.
-- `neuron-monitor` &mdash; JSON-stream metrics emitter, one record per period.
-
-For an **EEG-style time-series view** (one row per NeuronCore, shared time
-axis), this repo bundles a thin wrapper around `neuron-monitor`:
-[scripts/neuron_trace.py](../scripts/neuron_trace.py).
+- `neuron-top` — interactive `htop`-style snapshot of NeuronCore usage.
+- `neuron-monitor` — JSON-stream metrics emitter, one record per period.
 
 ```bash
-# 30 s capture @ 1 Hz, writes traces/neuron_<ts>.{jsonl,png}
-make trace
+# Real-time utilisation snapshot
+neuron-top
 
-# Live rolling-window plot (requires interactive matplotlib backend)
-make trace-live
+# Continuous JSON metrics stream (one record per second)
+neuron-monitor --period 1
 
-# Custom capture
-python scripts/neuron_trace.py --duration 60 --period 0.5 \
-    --output traces/run.jsonl --plot traces/run.png
-
-# Re-render an existing JSONL trace
-python scripts/neuron_trace.py --replot traces/run.jsonl
+# Kernel-level timelines (view in Perfetto UI)
+neuron-profile ...
 ```
-
-The script has no dependency on `lqcd_neuron` itself &mdash; it is safe to copy
-to any Inf2 / Trn1 host. It requires `neuron-monitor` on `PATH` (provided by
-the Neuron SDK) and `matplotlib` for plotting.
 
 For kernel-level timelines (closer to NVIDIA Nsight Systems), use
 `neuron-profile` from the Neuron SDK and view the trace in Perfetto.

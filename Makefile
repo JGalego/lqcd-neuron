@@ -110,18 +110,6 @@ bench:  ## Dslash throughput benchmark [NEURON=1] [NO_FUSED=1] [LATTICE="TxZxYxX
 	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py $(_BENCH_FLAGS)
 
 # ---------------------------------------------------------------------------
-# Profiling / monitoring
-# ---------------------------------------------------------------------------
-
-.PHONY: trace
-trace:  ## Capture per-NeuronCore utilization (30 s) + PNG (requires Inf2/Trn1)
-	. $(VENV_ACTIVATE) && $(PYTHON) scripts/neuron_trace.py
-
-.PHONY: trace-live
-trace-live:  ## Live EEG-style rolling view of NeuronCore utilization
-	. $(VENV_ACTIVATE) && $(PYTHON) scripts/neuron_trace.py --live
-
-# ---------------------------------------------------------------------------
 # Code quality
 # ---------------------------------------------------------------------------
 
