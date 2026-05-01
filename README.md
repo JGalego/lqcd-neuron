@@ -144,15 +144,25 @@ out_mc = D_mc(psi_global)      # psi_global shape: (num_cores * 8, T, Z, Y, X, N
 
 ## Performance
 
-Wilson Dslash throughput on a single Inf2 NeuronCore-v2 (BF16) vs CPU (FP32),
+Wilson Dslash throughput on an `inf2.8xlarge` (BF16) vs CPU (FP32),
 50 iterations after warm-up.  Numbers in **applications/sec** (higher is better).
+Speedup = best Neuron / CPU.
 
-| Lattice    | CPU  | Neuron (1-RHS) | Neuron (8-RHS) | Speedup vs CPU |
-|------------|-----:|---------------:|---------------:|---------------:|
-| 4×4×4×4    |  818 |           1419 |       **8957** |     **10.9×** |
-| 8×4×4×4    |  767 |            794 |       **4918** |      **6.4×** |
-| 8×8×4×4    |  646 |            372 |       **2481** |      **3.8×** |
-| 8×8×8×4    |  449 |            208 |       **1379** |      **3.1×** |
+| Lattice      |    CPU |  Neuron |  Batched | Multicore | Speedup |
+|--------------|-------:|--------:|---------:|----------:|--------:|
+| 4×4×4×4      |  804.6 |  1358.0 |   8521.5 | **10431.3** | **13.0×** |
+| 8×4×4×4      |  769.5 |   785.1 |   4786.3 |  **7519.1** |  **9.8×** |
+| 8×8×4×4      |  518.1 |   370.1 |   2511.1 |  **4229.5** |  **8.2×** |
+| 8×8×8×4      |  384.0 |   207.6 |   1390.1 |  **2474.2** |  **6.4×** |
+| 16×8×8×8     |  200.9 |    39.3 |    253.7 |    **435.9** |  **2.2×** |
+| 16×16×16×16  |   58.9 |     6.6 |     24.4 |       31.4 |   0.5× |
+
+> **Legend** — all throughputs in Dslash applications/sec (higher is better):
+> - **CPU** — CPU baseline, single RHS (FP32)
+> - **Neuron** — 1 NeuronCore, single RHS (BF16)
+> - **Batched** — 1 NeuronCore, 8 RHS per call (BF16)
+> - **Multicore** — 2 NeuronCores, 8 RHS each (BF16)
+> - **Speedup** — best Neuron / CPU
 
 Three compile-time optimisations make this possible:
 

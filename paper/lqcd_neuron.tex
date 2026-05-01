@@ -75,10 +75,10 @@ clover term, BLAS-1 reductions, and CG/BiCGStab solvers - as a pure
 transformations (gauge baking, fused $12{\times}12$ spin--colour
 matvecs, multi-RHS batching) plus a host-side data-parallel shard
 across all on-chip NeuronCores. On a single-core Inf2 NeuronCore-v2
-in BF16 we obtain up to $10.9\times$ throughput over a tuned FP32 CPU
-baseline for the Wilson Dslash on $V=4{\times}4{\times}4{\times}4$, and demonstrate that the
-optimised path remains competitive at $V=8{\times}8{\times}8{\times}4$ with no
-custom kernel code. Source code is available at
+in BF16 we obtain up to $13.0\times$ throughput over a tuned FP32 CPU
+baseline for the Wilson Dslash on $V=4{\times}4{\times}4{\times}4$ (two NeuronCores,
+$B{=}8$ RHS each), and establish that throughput falls below the CPU
+baseline beyond $V=16{\times}8{\times}8{\times}8$, all with no custom kernel code. Source code is available at
 \href{https://github.com/JGalego/lqcd-neuron}{github.com/JGalego/lqcd-neuron}
 under the Apache 2.0 license.
   \end{minipage}
@@ -130,8 +130,8 @@ competitive in throughput once the graph is shaped to fit the
 hardware?} We give an affirmative answer for the Wilson and
 Clover-Wilson Dslash and the iterative solvers built on them, with
 four composable graph-level optimisations that bring throughput from
-below CPU at modest volumes to up to $10.9\times$ above it on a single
-NeuronCore.
+below CPU at modest volumes to up to $13.0\times$ above it on a
+two-core Inf2 configuration.
 
 \section{Design and architecture}
 \label{sec:arch}
@@ -273,47 +273,56 @@ data-parallel shard multiplies by $N_{\mathrm{core}}$.
 \label{sec:results}
 
 \begin{table}[t]
-\caption{Wilson Dslash sustained throughput on a single Inf2
-NeuronCore-v2 (BF16, gauge baked) versus a tuned CPU baseline (FP32),
-in Dslash applications per second over 50 iterations after a
-5-iteration warm-up. ``8-RHS'' uses
-\texttt{compile\_dslash\_batched} with $B{=}8$. Speed-up is the
-best Neuron column relative to CPU.}
+\caption{Wilson Dslash sustained throughput on an \texttt{inf2.8xlarge}
+(BF16, gauge baked) versus a tuned CPU baseline (FP32), in Dslash
+applications per second over 50 iterations after a 5-iteration warm-up.
+Neuron = 1 NeuronCore, 1 RHS; Batched = 1 NeuronCore, $B{=}8$ RHS;
+Multicore = 2 NeuronCores, $B{=}8$ RHS each.  Speedup is the
+best Neuron column relative to CPU; entries below $1\times$ indicate
+the optimised Neuron path has not yet overcome the dispatch and
+bandwidth bottleneck at that volume.}
 \label{tab:bench}
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Lattice & CPU & N. 1-RHS & N. 8-RHS & Speed-up \\
+Lattice & CPU & Neuron & Batched & Multicore & Speedup \\
 \midrule
-$4{\times}4{\times}4{\times}4$               &  818 & 1419 & \textbf{8957} & $10.9\times$ \\
-$8{\times}4{\times}4{\times}4$               &  767 &  794 & \textbf{4918} &  $6.4\times$ \\
-$8{\times}8{\times}4{\times}4$               &  646 &  372 & \textbf{2481} &  $3.8\times$ \\
-$8{\times}8{\times}8{\times}4$               &  449 &  208 & \textbf{1379} &  $3.1\times$ \\
+$4{\times}4{\times}4{\times}4$           &  804.6 & 1358.0 &  8521.5 & \textbf{10431.3} & $13.0\times$ \\
+$8{\times}4{\times}4{\times}4$           &  769.5 &  785.1 &  4786.3 &  \textbf{7519.1} &  $9.8\times$ \\
+$8{\times}8{\times}4{\times}4$           &  518.1 &  370.1 &  2511.1 &  \textbf{4229.5} &  $8.2\times$ \\
+$8{\times}8{\times}8{\times}4$           &  384.0 &  207.6 &  1390.1 &  \textbf{2474.2} &  $6.4\times$ \\
+$16{\times}8{\times}8{\times}8$          &  200.9 &   39.3 &   253.7 &    \textbf{435.9} &  $2.2\times$ \\
+$16{\times}16{\times}16{\times}16$       &   58.9 &    6.6 &    24.4 &             31.4 &  $0.5\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Table~\ref{tab:bench} reports the throughput of the optimised
-\textsc{LQCD-Neuron} Wilson Dslash on a single Inf2 NeuronCore-v2,
+\textsc{LQCD-Neuron} Wilson Dslash on an \texttt{inf2.8xlarge},
 compared against a CPU baseline running the same reference
 \texttt{nn.Module} in FP32. Three observations are worth noting.
 
 First, the unoptimised single-RHS Neuron column (column~3) is only
-faster than CPU at the smallest volume; at $V=8{\times}8{\times}8{\times}4$ it is
-slower by a factor of two. This confirms our hypothesis that the
-naive Dslash graph is dispatch- and shape-limited: the work per call
-is too small to amortise the $\sim\!1\,$ms NeuronCore launch cost,
-and the underlying $3{\times}3$ / $4{\times}4$ einsums leave the MXU
-idle. Second, multi-RHS batching alone closes the gap and overtakes
-CPU by $3$--$11\times$ across the lattice range, with the largest
-relative gain at small $V$ where dispatch dominates. Third, the
-relative speed-up shrinks with volume because the CPU baseline scales
-nearly linearly while the on-chip BF16 throughput is bounded by
-NeuronCore-resident memory bandwidth at this size; the multi-core
-\texttt{DataParallel} path is designed to recover scaling and is
-described above.
+faster than CPU at the smallest volume; by $V=8{\times}8{\times}8{\times}4$ it is
+slower by nearly $2\times$, and at $V=16{\times}16{\times}16{\times}16$ by more
+than $8\times$. This confirms that the naive Dslash graph is
+dispatch- and shape-limited: the work per call is too small to
+amortise the $\sim\!1\,$ms NeuronCore launch cost, and the
+underlying $3{\times}3$ / $4{\times}4$ einsums leave the MXU idle.
+Second, multi-RHS batching closes the gap and overtakes CPU at all
+volumes up to $V=16{\times}8{\times}8{\times}8$ ($2.2\times$ advantage with
+Multicore), but falls below CPU at $V=16{\times}16{\times}16{\times}16$
+($0.5\times$ with Multicore), where the fused $12{\times}12$ kernel
+buffers alone exceed NeuronCore SRAM and spill to HBM. Third, the
+two-core \texttt{DataParallel} (Multicore) configuration delivers
+$6.4$--$13.0\times$ over CPU from $V=4^4$ through
+$V=8{\times}8{\times}8{\times}4$. The breakeven volume --- beyond which the
+CPU baseline is faster even with all optimisations --- lies between
+$V=16{\times}8{\times}8{\times}8$ and $V=16{\times}16{\times}16{\times}16$; bridging
+this gap is the primary motivation for the distributed multi-instance
+work outlined in Sec.~\ref{sec:outlook}.
 
 We have additionally verified, on CPU and on a 2-core Inf2 in
 \texttt{DataParallel} mode, that the BiCGStab and CG host-loop
