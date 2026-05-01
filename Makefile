@@ -79,28 +79,32 @@ smoke-neuron:  ## Run all examples with Neuron compilation (requires Inf2/Trn1)
 
 # ---------------------------------------------------------------------------
 # Benchmarks
+#
+# Options (all optional):
+#   NEURON=1              compile and run on NeuronCores (default: 0 = CPU only)
+#   NO_FUSED=1            disable fused (Ns*Nc)^2 kernels — A/B diagnostic
+#   LATTICE=TxZxYxX       benchmark only this lattice size
+#   LATTICE="A B C"       benchmark multiple specific sizes (space-separated)
+#
+# Examples:
+#   make bench
+#   make bench NEURON=1
+#   make bench NEURON=1 NO_FUSED=1
+#   make bench NEURON=1 LATTICE=16x8x8x8
+#   make bench NEURON=1 LATTICE="8x8x8x4 16x16x16x16" NO_FUSED=1
 # ---------------------------------------------------------------------------
 
+NEURON   ?= 0
+NO_FUSED ?= 0
+LATTICE  ?=
+
+_BENCH_FLAGS  = $(if $(filter 1,$(NEURON)),--neuron)
+_BENCH_FLAGS += $(if $(filter 1,$(NO_FUSED)),--no-fused)
+_BENCH_FLAGS += $(foreach l,$(LATTICE),--lattice $(l))
+
 .PHONY: bench
-bench:  ## CPU Dslash throughput benchmark
-	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py
-
-.PHONY: bench-neuron
-bench-neuron:  ## Neuron vs CPU Dslash throughput benchmark (requires Inf2/Trn1)
-	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py --neuron
-
-.PHONY: bench-neuron-no-fused
-bench-neuron-no-fused:  ## Same benchmark but with fused (Ns*Nc)^2 kernels disabled (A/B test for the large-lattice cliff)
-	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py --neuron --no-fused
-
-# Usage: make bench-lattice LATTICE=16x8x8x8   (add NEURON=1 for Neuron run)
-LATTICE ?= 8x4x4x4
-NEURON  ?= 0
-_NEURON_FLAG = $(if $(filter 1,$(NEURON)),--neuron,)
-
-.PHONY: bench-lattice
-bench-lattice:  ## Benchmark a single lattice size: make bench-lattice LATTICE=16x8x8x8 [NEURON=1]
-	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py $(_NEURON_FLAG) --lattice $(LATTICE)
+bench:  ## Dslash throughput benchmark [NEURON=1] [NO_FUSED=1] [LATTICE="TxZxYxX ..."]
+	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py $(_BENCH_FLAGS)
 
 # ---------------------------------------------------------------------------
 # Profiling / monitoring
@@ -179,9 +183,9 @@ connect-test:  ## Run tests on the instance
 	bash scripts/connect_inf2.sh --test
 
 .PHONY: connect-bench
-connect-bench:  ## Run benchmarks on the instance
+connect-bench:  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTICE="TxZxYxX ..."]
 	chmod +x scripts/connect_inf2.sh
-	bash scripts/connect_inf2.sh --bench
+	bash scripts/connect_inf2.sh --bench $(if $(filter 1,$(NEURON)),--neuron) $(if $(filter 1,$(NO_FUSED)),--no-fused) $(foreach l,$(LATTICE),--lattice $(l))
 
 .PHONY: tfvars
 tvars:  ## Copy the example tfvars file (edit before running tofu-apply)

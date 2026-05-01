@@ -32,17 +32,21 @@ RUN_TESTS=0
 RUN_BENCH=0
 USE_SSM=0
 LOCAL=0
+BENCH_FLAGS=""
 EXTRA_SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
 
 DLAMI_VENV="/opt/aws_neuronx_venv_pytorch_2_8"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --setup)  RUN_SETUP=1; shift ;;
-        --test)   RUN_TESTS=1; shift ;;
-        --bench)  RUN_BENCH=1; shift ;;
-        --ssm)    USE_SSM=1;   shift ;;
-        --local)  LOCAL=1;     shift ;;
+        --setup)     RUN_SETUP=1; shift ;;
+        --test)      RUN_TESTS=1; shift ;;
+        --bench)     RUN_BENCH=1; shift ;;
+        --ssm)       USE_SSM=1;   shift ;;
+        --local)     LOCAL=1;     shift ;;
+        --neuron)    BENCH_FLAGS="${BENCH_FLAGS} --neuron";   shift ;;
+        --no-fused)  BENCH_FLAGS="${BENCH_FLAGS} --no-fused"; shift ;;
+        --lattice)   BENCH_FLAGS="${BENCH_FLAGS} --lattice $2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -64,7 +68,7 @@ if [[ "${LOCAL}" -eq 1 ]]; then
         bash "${REPO_ROOT}/scripts/run_tests.sh" --test
     elif [[ "${RUN_BENCH}" -eq 1 ]]; then
         echo "[connect] Running benchmark locally …"
-        bash "${REPO_ROOT}/scripts/run_tests.sh" --bench
+        python examples/bench_dslash.py ${BENCH_FLAGS}
     elif [[ "${RUN_SETUP}" -eq 0 ]]; then
         echo "[connect] Nothing to do locally. Use --setup, --test, or --bench."
         echo "          (--local opens no interactive shell)"
@@ -161,7 +165,7 @@ if [[ "${RUN_BENCH}" -eq 1 ]]; then
 set -euo pipefail
 cd ~/lqcd-neuron && git pull
 [[ -d "${DLAMI_VENV}" ]] && source "${DLAMI_VENV}/bin/activate" || source ~/lqcd-neuron/.venv/bin/activate
-bash scripts/run_tests.sh --bench --neuron
+python examples/bench_dslash.py ${BENCH_FLAGS}
 REMOTE
 fi
 
