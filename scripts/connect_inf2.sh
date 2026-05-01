@@ -161,6 +161,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "${RUN_BENCH}" -eq 1 ]]; then
     echo "[connect] Running benchmark on the instance …"
+    echo "[connect] Bench flags: ${BENCH_FLAGS:-(none, CPU full sweep)}"
     $SSH <<REMOTE
 set -euo pipefail
 cd ~/lqcd-neuron && git pull

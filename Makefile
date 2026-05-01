@@ -104,6 +104,9 @@ _BENCH_FLAGS += $(foreach l,$(LATTICE),--lattice $(l))
 
 .PHONY: bench
 bench:  ## Dslash throughput benchmark [NEURON=1] [NO_FUSED=1] [LATTICE="TxZxYxX ..."]
+	@echo "Bench config: NEURON=$(NEURON)  NO_FUSED=$(NO_FUSED)  LATTICE=$(if $(LATTICE),$(LATTICE),(all))"
+	@echo "Flags:        $(_BENCH_FLAGS)"
+	@echo ""
 	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py $(_BENCH_FLAGS)
 
 # ---------------------------------------------------------------------------
