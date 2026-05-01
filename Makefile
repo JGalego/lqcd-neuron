@@ -68,6 +68,10 @@ bench:  ## CPU Dslash throughput benchmark
 bench-neuron:  ## Neuron vs CPU Dslash throughput benchmark (requires Inf2/Trn1)
 	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py --neuron
 
+.PHONY: bench-neuron-no-fused
+bench-neuron-no-fused:  ## Same benchmark but with fused (Ns*Nc)^2 kernels disabled (A/B test for the large-lattice cliff)
+	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py --neuron --no-fused
+
 # ---------------------------------------------------------------------------
 # Profiling / monitoring
 # ---------------------------------------------------------------------------

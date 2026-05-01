@@ -613,6 +613,7 @@ class NeuronCompiler:
         nc: int = 3,
         ns: int = 4,
         gauge_field: Optional[torch.Tensor] = None,
+        fused: bool = True,
     ) -> nn.Module:
         """Compile a Dslash / Dirac operator for a fixed lattice shape.
 
@@ -636,6 +637,15 @@ class NeuronCompiler:
                            buffers so only the spinor crosses PCIe per call.
                            Recommended for benchmarks and iterative solvers
                            where *U* stays constant.
+            fused:         When *True* (default) and *gauge_field* is provided,
+                           pre-compute per-site, per-direction
+                           ``(Ns*Nc) × (Ns*Nc)`` hopping kernels and bake them
+                           into the NEFF.  When *False* and *gauge_field* is
+                           provided, bake only the raw gauge tensor and keep
+                           the spin/colour einsums in the graph.  Useful for
+                           large lattices where the fused kernels overflow
+                           NeuronCore on-chip memory.  Ignored when
+                           *gauge_field* is *None*.
 
         Returns:
             Module with ``forward(psi, U)`` accepting ``complex64`` tensors.
@@ -676,6 +686,22 @@ class NeuronCompiler:
         cpu = torch.device("cpu")
 
         if gauge_field is not None:
+            if not fused:
+                # Bake the gauge field as raw (T,Z,Y,X,4,Nc,Nc) buffers but
+                # keep the spin/colour einsums in the traced graph.  Working
+                # set per call is ~12× smaller than the fused (Ns*Nc)² kernels,
+                # so this path can outperform the fused one once the latter
+                # overflows NeuronCore on-chip memory.
+                adapter = adapter.to(dt)
+                U_re = gauge_field.real.to(dt).contiguous()
+                U_im = gauge_field.imag.to(dt).contiguous()
+                baked = _BakedGaugeAdapter(adapter, U_re, U_im)
+                psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+                psi_im = torch.zeros_like(psi_re)
+                # No cache key — NEFF embeds this specific gauge configuration.
+                compiled = self.compile(baked, (psi_re, psi_im))
+                return _BakedGaugeDslashWrapper(compiled, compute_dtype=dt)
+
             # Bake the gauge field into the compiled model as fused per-site,
             # per-direction (Ns*Nc)×(Ns*Nc) hopping kernels.  At runtime each
             # call only does a roll + one large matvec per direction-side; the

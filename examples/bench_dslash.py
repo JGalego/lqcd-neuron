@@ -38,14 +38,28 @@ from lqcd_neuron.neuron import NeuronCompiler, get_device, is_neuron_available
 # ---------------------------------------------------------------------------
 
 LATTICE_SIZES: List[Tuple[int, int, int, int]] = [
+    # Microbenchmark / dispatch-overhead regime (toy volumes).
     (4, 4, 4, 4),
     (8, 4, 4, 4),
     (8, 8, 4, 4),
     (8, 8, 8, 4),
-    #(16, 8, 8, 8),
-    #(16, 16, 16, 16),
-    #(32, 16, 16, 16),
+    # Sustained-throughput regime: launch cost is amortised, the
+    # measurement reflects HBM bandwidth and MXU utilisation.
+    (16, 16, 16, 16),   # V = 65,536  sites
+    (24, 24, 24, 24),   # V = 331,776 sites
+    (32, 32, 32, 32),   # V = 1,048,576 sites - may exceed single-core HBM
 ]
+
+# Standard Wilson Dslash flop count (real flops per site, per RHS).
+# 1320 = 8 directions x (3x3 colour matvec + 4x4 spin matvec + accumulate),
+# matching the convention of Babich et al., SC'11 (arXiv:1109.2935).
+FLOPS_PER_SITE = 1320
+
+# Streaming bytes per site, per RHS, when the gauge field is baked into
+# the .neff (no PCIe traffic for U): one spinor in + one spinor out =
+# 2 * (Ns * Nc * 2 reals) = 2 * 24 = 48 reals = 192 B at FP32 (96 B at BF16).
+BYTES_PER_SITE_FP32 = 192
+BYTES_PER_SITE_BF16 = 96
 
 WARMUP_ITERS = 5
 BENCH_ITERS  = 50
@@ -98,7 +112,21 @@ def benchmark_batched(
     return n * B / elapsed
 
 
-def run(use_neuron: bool, mass: float = 0.1) -> None:
+def derived_metrics(aps: float, shape: Tuple[int, int, int, int],
+                    bf16: bool = False) -> Tuple[float, float]:
+    """Return (GFLOP/s, GB/s) for a measured apps-per-second number.
+
+    GFLOP/s uses the standard Wilson Dslash count of 1320 real flops/site.
+    GB/s is the streaming spinor in+out traffic (gauge field baked in HBM).
+    """
+    V = shape[0] * shape[1] * shape[2] * shape[3]
+    gflops = aps * V * FLOPS_PER_SITE / 1e9
+    bytes_per_site = BYTES_PER_SITE_BF16 if bf16 else BYTES_PER_SITE_FP32
+    gbps = aps * V * bytes_per_site / 1e9
+    return gflops, gbps
+
+
+def run(use_neuron: bool, mass: float = 0.1, fused: bool = True) -> None:
     dtype = torch.complex64
     nc    = 3
 
@@ -125,35 +153,60 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
         for shape in LATTICE_SIZES:
             T, Z, Y, X = shape
             geom   = LatticeGeometry(T=T, Z=Z, Y=Y, X=X)
-            U      = GaugeField.random(geom, seed=0).tensor
-            psi    = ColorSpinorField.gaussian(geom, seed=1).tensor
+            try:
+                U      = GaugeField.random(geom, seed=0).tensor
+                psi    = ColorSpinorField.gaussian(geom, seed=1).tensor
+            except (RuntimeError, MemoryError) as e:
+                # OOM at large volumes (e.g. 32^4 on a small host) is
+                # expected; record and continue rather than aborting.
+                results.append({
+                    "label": f"{T}x{Z}x{Y}x{X}",
+                    "cpu": float("nan"),
+                    "skipped": f"alloc failed: {type(e).__name__}",
+                })
+                continue
             D      = WilsonDirac(mass=mass, nc=nc, dtype=dtype)
 
             cpu_aps = benchmark_one(D.forward, psi, U, label="CPU")
 
             entry: dict = {
                 "label": f"{T}x{Z}x{Y}x{X}",
+                "shape": shape,
                 "cpu": cpu_aps,
             }
 
             if use_neuron:
-                D_n = compiler.compile_dslash(D, shape, nc=nc, gauge_field=U)
-                entry["neuron"] = benchmark_one(D_n, psi, U, label="Neuron")
-
-                D_b = compiler.compile_dslash_batched(
-                    D, shape, batch_size=BATCH_SIZE, gauge_field=U, nc=nc
-                )
-                psi_batch = psi.unsqueeze(0).expand(BATCH_SIZE, *psi.shape).contiguous()
-                entry["batched"] = benchmark_batched(D_b, psi_batch)
-
-                if show_multicore:
-                    mc_batch = num_cores * BATCH_SIZE
-                    D_mc = compiler.compile_dslash_multicore(
-                        D, shape, gauge_field=U, num_cores=num_cores,
-                        per_core_batch_size=BATCH_SIZE, nc=nc,
+                try:
+                    D_n = compiler.compile_dslash(
+                        D, shape, nc=nc, gauge_field=U, fused=fused,
                     )
-                    psi_mc = psi.unsqueeze(0).expand(mc_batch, *psi.shape).contiguous()
-                    entry["multicore"] = benchmark_batched(D_mc, psi_mc)
+                    entry["neuron"] = benchmark_one(D_n, psi, U, label="Neuron")
+
+                    # The Batched/Multicore paths currently always use the
+                    # fused kernel — skip them when running an unfused A/B
+                    # comparison so the table reflects a single code path.
+                    if not fused:
+                        results.append(entry)
+                        continue
+
+                    D_b = compiler.compile_dslash_batched(
+                        D, shape, batch_size=BATCH_SIZE, gauge_field=U, nc=nc
+                    )
+                    psi_batch = psi.unsqueeze(0).expand(BATCH_SIZE, *psi.shape).contiguous()
+                    entry["batched"] = benchmark_batched(D_b, psi_batch)
+
+                    if show_multicore:
+                        mc_batch = num_cores * BATCH_SIZE
+                        D_mc = compiler.compile_dslash_multicore(
+                            D, shape, gauge_field=U, num_cores=num_cores,
+                            per_core_batch_size=BATCH_SIZE, nc=nc,
+                        )
+                        psi_mc = psi.unsqueeze(0).expand(mc_batch, *psi.shape).contiguous()
+                        entry["multicore"] = benchmark_batched(D_mc, psi_mc)
+                except (RuntimeError, MemoryError) as e:
+                    # Compile/HBM failure at large volumes; report CPU
+                    # number only and continue.
+                    entry["neuron_error"] = f"{type(e).__name__}: {e}"
 
             results.append(entry)
     finally:
@@ -170,11 +223,11 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
         ]
         if show_multicore:
             cols.append(f"{'Multicore':>14}")
-        cols.append(f"{'Speedup':>8}")
+        cols += [f"{'Speedup':>8}", f"{'GFLOP/s':>10}", f"{'GB/s':>8}"]
         header = "  ".join(cols)
         ruler  = "-" * len(header)
     else:
-        header = f"{'Lattice':>16}  {'CPU':>14}"
+        header = f"{'Lattice':>16}  {'CPU':>14}  {'GFLOP/s':>10}  {'GB/s':>8}"
         ruler  = "-" * len(header)
 
     # Legend
@@ -187,19 +240,41 @@ def run(use_neuron: bool, mass: float = 0.1) -> None:
         if show_multicore:
             print(f"    Multicore = {num_cores} NeuronCores, {BATCH_SIZE} RHS each")
         print(f"    Speedup   = best Neuron / CPU")
+        print(f"    GFLOP/s   = derived from best Neuron column "
+              f"(1320 flops/site, Babich et al. 2011)")
+        print(f"    GB/s      = streaming spinor in+out, BF16 "
+              f"(gauge baked, no PCIe traffic for U)")
+    else:
+        print(f"    GFLOP/s   = derived from CPU column (1320 flops/site)")
+        print(f"    GB/s      = streaming spinor in+out, FP32")
     print()
     print(header)
     print(ruler)
 
     for entry in results:
+        if "skipped" in entry:
+            print(f"{entry['label']:>16}  [skipped: {entry['skipped']}]",
+                  flush=True)
+            continue
+        if entry.get("neuron_error") and use_neuron:
+            print(f"{entry['label']:>16}  {entry['cpu']:>14.1f}"
+                  f"  [neuron failed: {entry['neuron_error']}]",
+                  flush=True)
+            continue
+
         line = f"{entry['label']:>16}  {entry['cpu']:>14.1f}"
-        if use_neuron:
+        shape = entry.get("shape")
+        if use_neuron and "neuron" in entry:
             best = entry.get("multicore") or entry["batched"]
             speedup = best / entry["cpu"]
+            gflops, gbps = derived_metrics(best, shape, bf16=True)
             line += f"  {entry['neuron']:>14.1f}  {entry['batched']:>14.1f}"
             if show_multicore:
                 line += f"  {entry['multicore']:>14.1f}"
-            line += f"  {speedup:>7.1f}x"
+            line += f"  {speedup:>7.1f}x  {gflops:>10.2f}  {gbps:>8.2f}"
+        elif not use_neuron:
+            gflops, gbps = derived_metrics(entry["cpu"], shape, bf16=False)
+            line += f"  {gflops:>10.2f}  {gbps:>8.2f}"
         print(line, flush=True)
 
 
@@ -218,5 +293,15 @@ if __name__ == "__main__":
         "--mass", type=float, default=0.1,
         help="Wilson bare quark mass (default: 0.1).",
     )
+    parser.add_argument(
+        "--no-fused",
+        action="store_true",
+        help=(
+            "Disable fused (Ns*Nc)x(Ns*Nc) hopping kernels and bake only the "
+            "raw gauge tensor.  Lower per-site working set; useful for "
+            "diagnosing the fused-kernel SRAM-spill cliff at large lattices. "
+            "Implies single-RHS only — Batched/Multicore columns are skipped."
+        ),
+    )
     args = parser.parse_args()
-    run(use_neuron=args.neuron, mass=args.mass)
+    run(use_neuron=args.neuron, mass=args.mass, fused=not args.no_fused)
