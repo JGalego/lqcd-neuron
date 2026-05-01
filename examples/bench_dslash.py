@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -126,9 +126,31 @@ def derived_metrics(aps: float, shape: Tuple[int, int, int, int],
     return gflops, gbps
 
 
-def run(use_neuron: bool, mass: float = 0.1, fused: bool = True) -> None:
+def _parse_lattice(s: str) -> Tuple[int, int, int, int]:
+    """Parse a 'TxZxYxX' lattice string into a 4-tuple of ints."""
+    parts = s.replace("×", "x").split("x")
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(
+            f"Lattice must be TxZxYxX (e.g. 16x8x8x8), got: {s!r}"
+        )
+    try:
+        return tuple(int(p) for p in parts)  # type: ignore[return-value]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Non-integer dimension in lattice spec: {s!r}"
+        )
+
+
+def run(
+    use_neuron: bool,
+    mass: float = 0.1,
+    fused: bool = True,
+    lattices: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> None:
     dtype = torch.complex64
     nc    = 3
+
+    sizes = lattices if lattices else LATTICE_SIZES
 
     if use_neuron and not is_neuron_available():
         print("WARNING: --neuron requested but no Neuron hardware detected. "
@@ -150,7 +172,7 @@ def run(use_neuron: bool, mass: float = 0.1, fused: bool = True) -> None:
     real_stdout = sys.stdout
     sys.stdout = open(os.devnull, "w")
     try:
-        for shape in LATTICE_SIZES:
+        for shape in sizes:
             T, Z, Y, X = shape
             geom   = LatticeGeometry(T=T, Z=Z, Y=Y, X=X)
             try:
@@ -303,5 +325,23 @@ if __name__ == "__main__":
             "Implies single-RHS only — Batched/Multicore columns are skipped."
         ),
     )
+    parser.add_argument(
+        "--lattice",
+        metavar="TxZxYxX",
+        type=_parse_lattice,
+        action="append",
+        dest="lattices",
+        help=(
+            "Benchmark only this lattice size (e.g. --lattice 16x8x8x8). "
+            "May be repeated to benchmark multiple specific sizes: "
+            "--lattice 8x8x8x4 --lattice 16x16x16x16. "
+            "Omit to run the full default sweep."
+        ),
+    )
     args = parser.parse_args()
-    run(use_neuron=args.neuron, mass=args.mass, fused=not args.no_fused)
+    run(
+        use_neuron=args.neuron,
+        mass=args.mass,
+        fused=not args.no_fused,
+        lattices=args.lattices,
+    )

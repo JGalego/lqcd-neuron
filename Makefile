@@ -1,9 +1,30 @@
 .DEFAULT_GOAL := help
 
-# Detect whether we're inside a virtualenv already
-VENV_ACTIVATE := .venv/bin/activate
-PYTHON        := python3
-UV            := uv
+# ---------------------------------------------------------------------------
+# Virtual-environment detection
+# Pick the first activate script that exists, in priority order:
+#   1. An already-active venv (VIRTUAL_ENV set by the shell)
+#   2. AWS Neuron venv  (aws_neuron_venv_p38)
+#   3. uv / pip venv    (.venv)
+#   4. Plain venv       (venv)
+# Fall back to the uv-managed .venv path so 'make venv' still works.
+# ---------------------------------------------------------------------------
+
+ifneq ($(VIRTUAL_ENV),)
+  # Already inside an activated venv — no sourcing needed.
+  VENV_ACTIVATE := $(VIRTUAL_ENV)/bin/activate
+else ifneq ($(wildcard /opt/aws_neuronx_venv_pytorch_2_8/bin/activate),)
+  VENV_ACTIVATE := /opt/aws_neuronx_venv_pytorch_2_8/bin/activate
+else ifneq ($(wildcard .venv/bin/activate),)
+  VENV_ACTIVATE := .venv/bin/activate
+else ifneq ($(wildcard venv/bin/activate),)
+  VENV_ACTIVATE := venv/bin/activate
+else
+  VENV_ACTIVATE := .venv/bin/activate
+endif
+
+PYTHON := python3
+UV     := uv
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -71,6 +92,15 @@ bench-neuron:  ## Neuron vs CPU Dslash throughput benchmark (requires Inf2/Trn1)
 .PHONY: bench-neuron-no-fused
 bench-neuron-no-fused:  ## Same benchmark but with fused (Ns*Nc)^2 kernels disabled (A/B test for the large-lattice cliff)
 	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py --neuron --no-fused
+
+# Usage: make bench-lattice LATTICE=16x8x8x8   (add NEURON=1 for Neuron run)
+LATTICE ?= 8x4x4x4
+NEURON  ?= 0
+_NEURON_FLAG = $(if $(filter 1,$(NEURON)),--neuron,)
+
+.PHONY: bench-lattice
+bench-lattice:  ## Benchmark a single lattice size: make bench-lattice LATTICE=16x8x8x8 [NEURON=1]
+	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py $(_NEURON_FLAG) --lattice $(LATTICE)
 
 # ---------------------------------------------------------------------------
 # Profiling / monitoring
