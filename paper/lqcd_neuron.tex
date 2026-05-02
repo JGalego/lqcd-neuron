@@ -1,35 +1,40 @@
-\documentclass[11pt]{article}
+\documentclass[a4paper,11pt]{article}
 
-\usepackage[a4paper,margin=2.5cm]{geometry}
-\usepackage{amsmath,amssymb}
+% Page layout
+\usepackage[margin=1in]{geometry}
+
+% Math and symbols
+\usepackage{amsmath,amssymb,amsfonts}
+
+% Standard fonts (Computer Modern - LaTeX default)
+\usepackage[T1]{fontenc}
+
+% Graphics and color
 \usepackage{graphicx}
-\usepackage{booktabs}
-\usepackage{titling}
-\usepackage{titlesec}
-\usepackage{hyperref}
 \usepackage{xcolor}
+\usepackage{bm}
+
+% Tables
+\usepackage{booktabs}
+
+% Code listings
 \usepackage{listings}
+
+% Slashed notation
 \usepackage{slashed}
 
-\setlength{\droptitle}{-3em}
-\pretitle{\begin{center}\LARGE\bfseries}
-\posttitle{\par\end{center}\vskip 0.4em}
-\preauthor{\begin{center}\large}
-\postauthor{\par\end{center}}
-\predate{\begin{center}\small}
-\postdate{\par\end{center}}
+% Better justification / character protrusion
+\usepackage[protrusion=true,expansion=false]{microtype}
 
-% Section titles: "<num>. <TITLE IN UPPERCASE>", no bold, centred
-\titleformat{\section}[block]
-  {\normalfont\normalsize\centering}{\thesection.}{0.5em}{\MakeUppercase}
-\titleformat{\subsection}[block]
-  {\normalfont\normalsize\itshape\centering}{\thesubsection.}{0.5em}{}
-\titleformat{name=\section,numberless}[block]
-  {\normalfont\normalsize\centering}{}{0pt}{\MakeUppercase}
+% Hyperlinks - load last, enables clickable refs and citations
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
 
-\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
-
+% Allow a bit more stretch for tricky paragraphs (long \texttt strings)
 \setlength{\emergencystretch}{3em}
+
+% Line numbers for draft
+%\usepackage{lineno}
+%\linenumbers
 
 \lstset{
   basicstyle=\ttfamily\footnotesize,
@@ -41,36 +46,49 @@
   commentstyle=\color{gray},
 }
 
+% Macros
 \newcommand{\Dslash}{\slashed{D}}
 \newcommand{\NEFF}{\texttt{.neff}}
 \newcommand{\PyT}{\textsc{PyTorch}}
 \newcommand{\NeuronX}{\textsc{Neuron}}
 
-\title{LQCD-Neuron: Compiling Lattice QCD Kernels\\
-       to AWS Trainium and Inferentia via PyTorch--XLA}
+\begin{document}
 
-\author{Jo\~ao Galego\\
-\small Independent Researcher\\
-\small \texttt{jgalego1990@gmail.com}}
+%=============================================================================
+% TITLE
+%=============================================================================
+% AUTHOR PRESENTATION OPTIONS
+% Uncomment ONE of the following options:
+%=============================================================================
+
+% OPTION 2: Author with AI Assistant credit line
+\newcommand{\authorblock}{%
+\author{Jo\~ao Galego$^{1}$\\[0.5em]
+\small\itshape $^1$Independent Researcher\\[1.2em]
+\normalsize\textsc{AI Research Assistant}: Claude Opus 4.7 (Anthropic)}
+}
+
+%=============================================================================
+
+\title{No CUDA, No Problem:\\[0.3em]
+       Lattice QCD on AWS Trainium and Inferentia via PyTorch--XLA}
+
+\authorblock
 
 \date{\today}
 
-\begin{document}
-
 \maketitle
 
-\begin{center}
-  \begin{minipage}{0.85\textwidth}
-    \begin{center}\bfseries Abstract\end{center}
-    \small
+\begin{abstract}
+\noindent
 We present \textsc{LQCD-Neuron}, a Python library that runs Wilson- and
 Clover-Wilson Lattice QCD on AWS Trainium (Trn1) and Inferentia (Inf2)
 accelerators. The hardware exposes no general-purpose compute API
 (no CUDA, HIP, or OpenCL); the only programming model is to compile a
 PyTorch / XLA graph ahead of time with \texttt{neuronx-cc} and execute
 the resulting NeuronCore Executable File Format (\NEFF) binary. We
-re-express every hot-path lattice kernel - the Wilson Dslash, the
-clover term, BLAS-1 reductions, and CG/BiCGStab solvers - as a pure
+re-express every hot-path lattice kernel-the Wilson Dslash, the
+clover term, BLAS-1 reductions, and CG/BiCGStab solvers-as a pure
 \texttt{torch.nn.Module}, and rely on three compile-time
 transformations (gauge baking, fused $12{\times}12$ spin--colour
 matvecs, multi-RHS batching) plus a host-side data-parallel shard
@@ -78,12 +96,13 @@ across all on-chip NeuronCores. On a single-core Inf2 NeuronCore-v2
 in BF16 we obtain up to $13.0\times$ throughput over a tuned FP32 CPU
 baseline for the Wilson Dslash on $V=4{\times}4{\times}4{\times}4$ (two NeuronCores,
 $B{=}8$ RHS each), and establish that throughput reaches CPU parity at
-$V=16{\times}8{\times}8{\times}8$ and falls below beyond that, all with no custom kernel code. Source code is available at
+$V=16{\times}8{\times}8{\times}8$ and falls below beyond that, all with no
+custom kernel code. Source code is available at
 \href{https://github.com/JGalego/lqcd-neuron}{github.com/JGalego/lqcd-neuron}
-under the Apache 2.0 license.
-  \end{minipage}
-\end{center}
-\vspace{1.5em}
+under the Apache 2.0 license. All calculations, numerical analysis, and
+manuscript preparation were performed by Claude, an AI assistant developed
+by Anthropic, working under physicist supervision.
+\end{abstract}
 
 
 \section{Introduction}
@@ -107,8 +126,8 @@ times. On NVIDIA GPUs the standard tool is
 \textsc{QUDA}~\cite{Clark:2009wm,Babich:2011np}: hand-written CUDA
 kernels, dynamic shapes, runtime auto-tuning, and a multigrid
 preconditioner~\cite{Brower:2018kgy}. We ask whether comparable
-performance is reachable on AWS-designed ML accelerators --- Trainium
-(Trn1) and Inferentia (Inf2) --- which expose a fundamentally
+performance is reachable on AWS-designed ML accelerators - Trainium
+(Trn1) and Inferentia (Inf2) - which expose a fundamentally
 different programming model.
 
 Each NeuronCore-v2 is a purpose-built matrix engine. It offers no
@@ -251,9 +270,10 @@ The threshold can be overridden via
 
 Production multi-source propagator inverters already solve $D\,x = b_i$
 for $N_s\!\cdot\!N_c=12$ right-hand sides per source, one per
-spin\,$\times$\,colour combination. We expose this directly:
-\texttt{compile\_dslash\_batched($D$, $\mathrm{shape}$, batch\_size=$B$,
-gauge\_field=$U$)} traces the fused operator on
+spin\,$\times$\,colour combination. We expose this directly,
+\texttt{compile\_dslash\_batched(}$D$, $\mathrm{shape}$,
+\texttt{batch\_size=}$B$, \texttt{gauge\_field=}$U$\texttt{)},
+which traces the fused operator on
 $\psi\in\mathbb{C}^{B\times T\times Z\times Y\times X\times N_s\times N_c}$.
 The baked $K$ buffers carry a singleton batch axis that broadcasts
 across all $B$ RHS, and the lattice rolls use negative-dim indexing so
@@ -267,7 +287,7 @@ amortised over $B$ problems.
 A single NeuronCore-v2 is one of $N_{\mathrm{core}}$ cores per
 accelerator chip; \texttt{inf2.xlarge} exposes 2,
 \texttt{trn1.32xlarge} 32. We replicate the compiled \NEFF\ across
-all detected cores via \texttt{torch\_neuronx.DataParallel} and
+all detected cores via \texttt{torch\_neuronx.}\allowbreak\texttt{DataParallel} and
 split a global batch of $N_{\mathrm{core}}\!\cdot\! B_{\mathrm{core}}$
 RHS along dim~0:
 \begin{lstlisting}
@@ -318,7 +338,8 @@ $16{\times}16{\times}16{\times}16$       &   59.6 &    1.2 &    24.4 &          
 \end{table}
 
 Table~\ref{tab:bench} reports the throughput of the optimised
-\textsc{LQCD-Neuron} Wilson Dslash on an \texttt{inf2.8xlarge},
+\textsc{LQCD-Neuron} Wilson Dslash on an
+\texttt{inf2.8xlarge},
 compared against a CPU baseline running the same reference
 \texttt{nn.Module} in FP32. Three observations are worth noting.
 
@@ -340,8 +361,8 @@ compiler automatically falls back to the unfused baked-gauge path,
 eliminating the MXU-utilisation benefit of the fused kernels.
 Third, the two-core \texttt{DataParallel} (Multicore) configuration
 delivers $6.4$--$13.0\times$ over CPU from $V=4^4$ through
-$V=8{\times}8{\times}8{\times}4$. The breakeven volume --- beyond which the
-CPU baseline is faster even with all optimisations --- is now at
+$V=8{\times}8{\times}8{\times}4$. The breakeven volume - beyond which the
+CPU baseline is faster even with all optimisations - is now at
 $V=16{\times}8{\times}8{\times}8$ (CPU parity, $1.0\times$); the fused-kernel
 SRAM limit is the primary obstacle to recovering the $2\times$--$3\times$
 advantage that would otherwise be expected at these volumes, and
@@ -379,9 +400,10 @@ is the natural next step and is what is required to address physically
 relevant volumes ($V\!\gtrsim\!32{\times}32{\times}32{\times}32$) that exceed single-chip HBM.
 
 \paragraph*{Static shapes.}
-The most awkward limitation is the static-shape requirement: each
-$(\mathrm{class},\mathrm{shape},\mathrm{dtype},B)$ tuple compiles to a
-distinct \NEFF. For a fixed production volume this is amortised once,
+The most awkward limitation is the static-shape requirement:
+each tuple
+$(\mathrm{class},\mathrm{shape},\mathrm{dtype},B)$
+compiles to a distinct \NEFF. For a fixed production volume this is amortised once,
 but for shape-sweeping workloads (auto-tuning, mixed-volume gauge
 ensembles) it is a real cost. \texttt{neuronx-cc} bucketing and
 shape-polymorphic XLA are partial mitigations.
@@ -411,6 +433,22 @@ baseline on $V=4{\times}4{\times}4{\times}4$ in BF16.
 The author thanks the AWS Neuron SDK team for documentation and
 support, and the developers of \PyT, XLA, and \textsc{QUDA} whose
 designs informed the architecture of this work.
+
+\section*{Author Contributions}
+
+J.G.\ conceived and directed the project, defined the scope and target
+hardware, guided the AI assistant throughout development, validated the
+benchmark results on AWS Inferentia (Inf2) instances, and reviewed all
+code and prose for scientific and engineering correctness. Claude, an AI
+research assistant developed by Anthropic, performed the implementation
+work-including the \texttt{torch.nn.Module} kernel design, the four
+graph-level optimisations (gauge baking, fused $12{\times}12$
+spin--colour kernels, multi-RHS batching, and multi-core
+\texttt{DataParallel} sharding), the unit-test suite, the benchmark
+harness, the numerical analysis, and the manuscript preparation. The
+work was conducted using Claude Code, Anthropic's agentic coding tool.
+J.G.\ is fully responsible for the scientific and technical content
+and integrity of this paper.
 
 \begin{thebibliography}{99}
 

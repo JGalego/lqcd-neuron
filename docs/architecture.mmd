@@ -1,0 +1,119 @@
+graph TD
+    %% ── User entry-points ──────────────────────────────────────────────────
+    USER["User Python code"]
+
+    %% ── params ─────────────────────────────────────────────────────────────
+    subgraph PARAMS["params.py"]
+        GP["GaugeParam"]
+        IP["InvertParam"]
+        CP["CloverParam"]
+        NCP["NeuronCompileParam"]
+    end
+
+    %% ── core ───────────────────────────────────────────────────────────────
+    subgraph CORE["core/"]
+        LG["LatticeGeometry\n(T, Z, Y, X descriptor)"]
+        GF["GaugeField\n(SU(Nc) link tensor)\ncold / random / unitarize"]
+        CSF["ColorSpinorField\n(quark spinor ψ)\npoint_source / gaussian"]
+    end
+
+    %% ── dirac ──────────────────────────────────────────────────────────────
+    subgraph DIRAC["dirac/"]
+        GM["gamma.py\nEuclidean γ-matrices\n(DeGrand-Rossi basis)"]
+        WD["WilsonDslash\n(nn.Module)"]
+        WDirac["WilsonDirac\nM, M†, M†M\n(nn.Module)"]
+        CWD["CloverWilsonDirac\nSW-improved\n(nn.Module)"]
+    end
+
+    %% ── blas ───────────────────────────────────────────────────────────────
+    subgraph BLAS["blas/"]
+        LB["lattice_blas.py\ninner / norm2 / axpy / xpay\n(JIT-scriptable)"]
+    end
+
+    %% ── solvers ─────────────────────────────────────────────────────────────
+    subgraph SOLVERS["solvers/"]
+        CG["ConjugateGradient\n(host loop + device matvec)"]
+        BICG["BiCGStab\n(host loop + device matvec)"]
+    end
+
+    %% ── observables ─────────────────────────────────────────────────────────
+    subgraph OBS["observables/"]
+        PL["plaquette\nwilson_action\ntopological_charge"]
+        POL["polyakov_loop\npolyakov_loop_spatially_resolved"]
+    end
+
+    %% ── neuron ───────────────────────────────────────────────────────────────
+    subgraph NEURON["neuron/"]
+        ND["NeuronDevice\nTrn1 / Inf2 / CPU fallback"]
+        NC["NeuronCompiler\ntorch_neuronx.trace wrapper\ngauge-baking + fused kernels\ncompile_dslash_batched\ncompile_dslash_multicore"]
+    end
+
+    %% ── compilation pipeline ─────────────────────────────────────────────────
+    subgraph PIPELINE["Compilation pipeline"]
+        direction TB
+        XLA["XLA HLO graph\n(torch_neuronx.trace)"]
+        CC["neuronx-cc\nXLA HLO → NeuronCore ISA"]
+        NEFF[".neff binary"]
+        HW["NeuronCore-v2\n(Trn1 / Inf2)"]
+    end
+
+    %% ── edges: user → modules ────────────────────────────────────────────────
+    USER --> CORE
+    USER --> DIRAC
+    USER --> SOLVERS
+    USER --> OBS
+
+    %% ── core inter-dependencies ──────────────────────────────────────────────
+    LG --> GF
+    LG --> CSF
+
+    %% ── dirac dependencies ───────────────────────────────────────────────────
+    GM --> WD
+    GM --> WDirac
+    GM --> CWD
+    WD --> WDirac
+    WD --> CWD
+    GF --> WDirac
+    GF --> CWD
+    CSF --> WDirac
+    CSF --> CWD
+
+    %% ── solver dependencies ──────────────────────────────────────────────────
+    WDirac --> CG
+    CWD    --> CG
+    WDirac --> BICG
+    CWD    --> BICG
+    LB     --> CG
+    LB     --> BICG
+
+    %% ── observable dependencies ──────────────────────────────────────────────
+    GF --> PL
+    GF --> POL
+
+    %% ── neuron compilation flow ──────────────────────────────────────────────
+    WD     --> NC
+    WDirac --> NC
+    CWD    --> NC
+    NC     --> XLA
+    XLA    --> CC
+    CC     --> NEFF
+    NEFF   --> HW
+    ND     --> NC
+
+    %% ── params wiring ────────────────────────────────────────────────────────
+    GP  --> GF
+    IP  --> CG
+    IP  --> BICG
+    CP  --> CWD
+    NCP --> NC
+
+    %% ── styles ───────────────────────────────────────────────────────────────
+    classDef module  fill:#1e3a5f,stroke:#4a90d9,color:#e8f4fd
+    classDef hw      fill:#2d4a1e,stroke:#5a9945,color:#e8fde8
+    classDef compile fill:#4a2d1e,stroke:#d97845,color:#fde8d8
+    classDef user    fill:#3a1e4a,stroke:#9945d9,color:#f0e8fd
+
+    class LG,GF,CSF,GM,WD,WDirac,CWD,LB,CG,BICG,PL,POL,ND,NC,GP,IP,CP,NCP module
+    class HW hw
+    class XLA,CC,NEFF compile
+    class USER user
