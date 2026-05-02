@@ -148,14 +148,18 @@ Wilson Dslash throughput on an `inf2.8xlarge` (BF16) vs CPU (FP32),
 50 iterations after warm-up.  Numbers in **applications/sec** (higher is better).
 Speedup = best Neuron / CPU.
 
-| Lattice      |    CPU |  Neuron |  Batched | Multicore | Speedup |
-|--------------|-------:|--------:|---------:|----------:|--------:|
-| 4×4×4×4      |  804.6 |  1358.0 |   8521.5 | **10431.3** | **13.0×** |
-| 8×4×4×4      |  769.5 |   785.1 |   4786.3 |  **7519.1** |  **9.8×** |
-| 8×8×4×4      |  518.1 |   370.1 |   2511.1 |  **4229.5** |  **8.2×** |
-| 8×8×8×4      |  384.0 |   207.6 |   1390.1 |  **2474.2** |  **6.4×** |
-| 16×8×8×8     |  200.9 |    39.3 |    253.7 |    **435.9** |  **2.2×** |
-| 16×16×16×16  |   58.9 |     6.6 |     24.4 |       31.4 |   0.5× |
+| Lattice      |    CPU |  Neuron |  Batched | Multicore | Speedup | GFLOP/s |  GB/s |
+|--------------|-------:|--------:|---------:|----------:|--------:|--------:|------:|
+| 4×4×4×4      |  804.6 |  1358.0 |   8521.5 | **10431.3** | **13.0×** |    3.52 |  0.26 |
+| 8×4×4×4      |  769.5 |   785.1 |   4786.3 |  **7519.1** |  **9.8×** |    5.08 |  0.37 |
+| 8×8×4×4      |  518.1 |   370.1 |   2511.1 |  **4229.5** |  **8.2×** |    5.72 |  0.42 |
+| 8×8×8×4      |  384.0 |   207.6 |   1390.1 |  **2474.2** |  **6.4×** |    6.69 |  0.49 |
+| 16×8×8×8     |  229.2 |    37.2 |    253.8 |      220.1 |   1.0× †|    2.38 |  0.17 |
+| 16×16×16×16  |   59.6 |     1.2 |     24.4 |       15.8 |   0.3× †|    1.36 |  0.10 |
+
+> **†** Fused kernels exceed NeuronCore SRAM budget (14.4 MiB) at this volume;
+> the compiler automatically falls back to the unfused baked-gauge path.
+> Override with `NeuronCompiler(sram_threshold_bytes=N)` or `fused=False`.
 
 > **Legend** — all throughputs in Dslash applications/sec (higher is better):
 > - **CPU** — CPU baseline, single RHS (FP32)
@@ -163,6 +167,8 @@ Speedup = best Neuron / CPU.
 > - **Batched** — 1 NeuronCore, 8 RHS per call (BF16)
 > - **Multicore** — 2 NeuronCores, 8 RHS each (BF16)
 > - **Speedup** — best Neuron / CPU
+> - **GFLOP/s** — derived from the Multicore column (1320 FLOP/site, Babich et al. 2011)
+> - **GB/s** — streaming spinor in+out, BF16 (gauge baked; no PCIe traffic for U)
 
 Three compile-time optimisations make this possible:
 

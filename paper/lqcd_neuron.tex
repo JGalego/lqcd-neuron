@@ -77,8 +77,8 @@ matvecs, multi-RHS batching) plus a host-side data-parallel shard
 across all on-chip NeuronCores. On a single-core Inf2 NeuronCore-v2
 in BF16 we obtain up to $13.0\times$ throughput over a tuned FP32 CPU
 baseline for the Wilson Dslash on $V=4{\times}4{\times}4{\times}4$ (two NeuronCores,
-$B{=}8$ RHS each), and establish that throughput falls below the CPU
-baseline beyond $V=16{\times}8{\times}8{\times}8$, all with no custom kernel code. Source code is available at
+$B{=}8$ RHS each), and establish that throughput reaches CPU parity at
+$V=16{\times}8{\times}8{\times}8$ and falls below beyond that, all with no custom kernel code. Source code is available at
 \href{https://github.com/JGalego/lqcd-neuron}{github.com/JGalego/lqcd-neuron}
 under the Apache 2.0 license.
   \end{minipage}
@@ -234,6 +234,19 @@ round-off (relative error $\lesssim 10^{-7}$), and continues to satisfy
 the existing $\gamma_5$-Hermiticity, adjoint, and normal-operator
 positivity tests.
 
+\paragraph*{SRAM budget guard.}
+The eight $K^{\mathrm{fwd/bwd}}$ buffers have per-lattice footprint
+$8V\!\cdot\!144\!\cdot\!4$ bytes (float32 real/imaginary pairs).  This
+already exceeds the 14.4\,MiB NeuronCore on-chip SRAM at
+$V=16{\times}8{\times}8{\times}8$ (36\,MiB) and reaches 288\,MiB at
+$V=16{\times}16{\times}16{\times}16$.  The compiler therefore checks the fused
+footprint against a configurable SRAM threshold before tracing; if the
+budget is exceeded it issues a warning and falls back to the unfused
+baked-gauge path, preserving correctness at reduced MXU efficiency.
+The threshold can be overridden via
+\texttt{NeuronCompiler(sram\_threshold\_bytes=N)} or suppressed with
+\texttt{fused=False}.
+
 \subsection{Multi-right-hand-side batching}
 
 Production multi-source propagator inverters already solve $D\,x = b_i$
@@ -278,23 +291,28 @@ data-parallel shard multiplies by $N_{\mathrm{core}}$.
 applications per second over 50 iterations after a 5-iteration warm-up.
 Neuron = 1 NeuronCore, 1 RHS; Batched = 1 NeuronCore, $B{=}8$ RHS;
 Multicore = 2 NeuronCores, $B{=}8$ RHS each.  Speedup is the
-best Neuron column relative to CPU; entries below $1\times$ indicate
+Multicore column relative to CPU; entries at or below $1\times$ indicate
 the optimised Neuron path has not yet overcome the dispatch and
-bandwidth bottleneck at that volume.}
+bandwidth bottleneck at that volume.  GFLOP/s and GB/s are derived
+from the Multicore column (1320 flop/site~\cite{Babich:2011np};
+streaming spinor in${+}$out, BF16; gauge baked, no PCIe traffic for
+$U$).  $\dagger$~Fused kernels exceed the
+14.4\,MiB NeuronCore SRAM budget at this volume; the compiler
+automatically falls back to the unfused baked-gauge path.}
 \label{tab:bench}
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrrrrr r}
 \toprule
-Lattice & CPU & Neuron & Batched & Multicore & Speedup \\
+Lattice & CPU & Neuron & Batched & Multicore & Speedup & GFLOP/s & GB/s \\
 \midrule
-$4{\times}4{\times}4{\times}4$           &  804.6 & 1358.0 &  8521.5 & \textbf{10431.3} & $13.0\times$ \\
-$8{\times}4{\times}4{\times}4$           &  769.5 &  785.1 &  4786.3 &  \textbf{7519.1} &  $9.8\times$ \\
-$8{\times}8{\times}4{\times}4$           &  518.1 &  370.1 &  2511.1 &  \textbf{4229.5} &  $8.2\times$ \\
-$8{\times}8{\times}8{\times}4$           &  384.0 &  207.6 &  1390.1 &  \textbf{2474.2} &  $6.4\times$ \\
-$16{\times}8{\times}8{\times}8$          &  200.9 &   39.3 &   253.7 &    \textbf{435.9} &  $2.2\times$ \\
-$16{\times}16{\times}16{\times}16$       &   58.9 &    6.6 &    24.4 &             31.4 &  $0.5\times$ \\
+$4{\times}4{\times}4{\times}4$           &  804.6 & 1358.0 &  8521.5 & \textbf{10431.3} & $13.0\times$ & 3.52 & 0.26 \\
+$8{\times}4{\times}4{\times}4$           &  769.5 &  785.1 &  4786.3 &  \textbf{7519.1} &  $9.8\times$ & 5.08 & 0.37 \\
+$8{\times}8{\times}4{\times}4$           &  518.1 &  370.1 &  2511.1 &  \textbf{4229.5} &  $8.2\times$ & 5.72 & 0.42 \\
+$8{\times}8{\times}8{\times}4$           &  384.0 &  207.6 &  1390.1 &  \textbf{2474.2} &  $6.4\times$ & 6.69 & 0.49 \\
+$16{\times}8{\times}8{\times}8$          &  229.2 &   37.2 &   253.8 &            220.1 & $1.0\times^\dagger$ & 2.38 & 0.17 \\
+$16{\times}16{\times}16{\times}16$       &   59.6 &    1.2 &    24.4 &             15.8 & $0.3\times^\dagger$ & 1.36 & 0.10 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -312,17 +330,23 @@ dispatch- and shape-limited: the work per call is too small to
 amortise the $\sim\!1\,$ms NeuronCore launch cost, and the
 underlying $3{\times}3$ / $4{\times}4$ einsums leave the MXU idle.
 Second, multi-RHS batching closes the gap and overtakes CPU at all
-volumes up to $V=16{\times}8{\times}8{\times}8$ ($2.2\times$ advantage with
-Multicore), but falls below CPU at $V=16{\times}16{\times}16{\times}16$
-($0.5\times$ with Multicore), where the fused $12{\times}12$ kernel
-buffers alone exceed NeuronCore SRAM and spill to HBM. Third, the
-two-core \texttt{DataParallel} (Multicore) configuration delivers
-$6.4$--$13.0\times$ over CPU from $V=4^4$ through
+volumes up to $V=8{\times}8{\times}8{\times}4$, but reaches only CPU parity at
+$V=16{\times}8{\times}8{\times}8$ ($1.0\times$ with Multicore)$^\dagger$ and falls
+clearly below at $V=16{\times}16{\times}16{\times}16$ ($0.3\times$ with Multicore)$^\dagger$.
+At both large volumes the fused $12{\times}12$ kernel buffers alone
+exceed the 14.4\,MiB NeuronCore on-chip SRAM (36\,MiB at
+$16{\times}8{\times}8{\times}8$ and 288\,MiB at $16{\times}16{\times}16{\times}16$), so the
+compiler automatically falls back to the unfused baked-gauge path,
+eliminating the MXU-utilisation benefit of the fused kernels.
+Third, the two-core \texttt{DataParallel} (Multicore) configuration
+delivers $6.4$--$13.0\times$ over CPU from $V=4^4$ through
 $V=8{\times}8{\times}8{\times}4$. The breakeven volume --- beyond which the
-CPU baseline is faster even with all optimisations --- lies between
-$V=16{\times}8{\times}8{\times}8$ and $V=16{\times}16{\times}16{\times}16$; bridging
-this gap is the primary motivation for the distributed multi-instance
-work outlined in Sec.~\ref{sec:outlook}.
+CPU baseline is faster even with all optimisations --- is now at
+$V=16{\times}8{\times}8{\times}8$ (CPU parity, $1.0\times$); the fused-kernel
+SRAM limit is the primary obstacle to recovering the $2\times$--$3\times$
+advantage that would otherwise be expected at these volumes, and
+bridging it (via kernel tiling or NeuronCore SRAM bucketing) is the
+primary motivation for the work outlined in Sec.~\ref{sec:outlook}.
 
 We have additionally verified, on CPU and on a 2-core Inf2 in
 \texttt{DataParallel} mode, that the BiCGStab and CG host-loop
