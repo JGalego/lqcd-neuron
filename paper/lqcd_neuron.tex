@@ -92,12 +92,18 @@ clover term, BLAS-1 reductions, and CG/BiCGStab solvers-as a pure
 \texttt{torch.nn.Module}, and rely on three compile-time
 transformations (gauge baking, fused $12{\times}12$ spin--colour
 matvecs, multi-RHS batching) plus a host-side data-parallel shard
-across all on-chip NeuronCores. On a single-core Inf2 NeuronCore-v2
+across all on-chip NeuronCores. On a two-core Inf2 (\texttt{inf2.xlarge})
 in BF16 we obtain up to $13.0\times$ throughput over a tuned FP32 CPU
-baseline for the Wilson Dslash on $V=4{\times}4{\times}4{\times}4$ (two NeuronCores,
-$B{=}8$ RHS each), and establish that throughput reaches CPU parity at
+baseline for the Wilson Dslash on $V=4{\times}4{\times}4{\times}4$ ($B{=}8$
+RHS per core), and establish that throughput reaches CPU parity at
 $V=16{\times}8{\times}8{\times}8$ and falls below beyond that, all with no
-custom kernel code. Source code is available at
+custom kernel code. We emphasise that these speedups are achieved on
+sub-production volumes; sustained throughput remains $\le 7$\,GFLOP/s,
+well below both the NeuronCore-v2 BF16 peak and published QUDA
+numbers for Wilson Dslash on contemporary GPUs. The work is therefore
+best read as a feasibility / lessons-learned study of the AoT-compiled,
+static-graph programming model rather than a competitive
+implementation. Source code is available at
 \href{https://github.com/JGalego/lqcd-neuron}{github.com/JGalego/lqcd-neuron}
 under the Apache 2.0 license. All calculations, numerical analysis, and
 manuscript preparation were performed by Claude, an AI assistant developed
@@ -119,7 +125,12 @@ formulation~\cite{Wilson:1974sk},
 \label{eq:wilson}
 \end{equation}
 with gauge links $U(x,\mu)\!\in\!\mathrm{SU}(3)$ and Dirac matrices
-$\gamma_\mu$ acting on the four-component spinor. A single application
+$\gamma_\mu$ acting on the four-component spinor. We use the
+unhopped (mass-form) normalisation; the equivalent $\kappa$-form,
+$\kappa = 1/(2(m+4))$, is recovered by rescaling $\psi$. Anti-periodic
+temporal boundary conditions are imposed by multiplying the temporal
+gauge links on the boundary timeslice by $-1$, after which all shifts
+can be implemented as periodic \texttt{torch.roll}s.
 performs $\mathcal{O}(V)$ tiny dense $3{\times}3$ and $4{\times}4$
 contractions, and a Krylov inversion invokes it tens of thousands of
 times. On NVIDIA GPUs the standard tool is
@@ -170,7 +181,7 @@ Eq.~\eqref{eq:wilson} is statically unrolled at trace time, producing
 a pure DAG that the compiler can schedule.
 
 \paragraph*{Gamma matrices.}
-The Euclidean Dirac matrices are stored in the DeGrand--Rossi (chiral)
+The Euclidean Dirac matrices are stored in the DeGrand--Rossi
 basis~\cite{DeGrandRossi} and registered as non-trainable
 \texttt{nn.Module} buffers, so they migrate with the module to
 NeuronCore memory under \texttt{torch\_neuronx.trace} and remain
@@ -181,7 +192,8 @@ Iterative solvers need a convergence test on a scalar reduction at
 every iteration, but \texttt{neuronx-cc} only supports static graphs.
 We adopt the standard deep-learning split: the Krylov loop runs on the
 host (CPU) and only the matvec $D\psi$ is compiled to NeuronCore.
-For Conjugate Gradient~\cite{HestenesStiefel}, schematically:
+For Conjugate Gradient~\cite{HestenesStiefel} (and analogously
+BiCGStab~\cite{vanderVorst}), schematically:
 \begin{lstlisting}
 for k in range(maxiter):
     Ap    = D_neuron(p, U)        # NeuronCore
@@ -248,17 +260,17 @@ The $12{\times}12$ shape is markedly better suited to the NeuronCore
 matrix multiplication unit (MXU) than the original $3{\times}3$ /
 $4{\times}4$ einsums. The four backward rolls are absorbed into
 $K^{\mathrm{bwd}}$, halving the lattice-shift count. The fused kernel
-is bit-equivalent to the reference \texttt{forward()} up to FP32
-round-off (relative error $\lesssim 10^{-7}$), and continues to satisfy
+agrees with the reference \texttt{forward()} to a relative error
+$\lesssim 10^{-7}$ in FP32, and continues to satisfy
 the existing $\gamma_5$-Hermiticity, adjoint, and normal-operator
 positivity tests.
 
 \paragraph*{SRAM budget guard.}
 The eight $K^{\mathrm{fwd/bwd}}$ buffers have per-lattice footprint
-$8V\!\cdot\!144\!\cdot\!4$ bytes (float32 real/imaginary pairs).  This
-already exceeds the 14.4\,MiB NeuronCore on-chip SRAM at
-$V=16{\times}8{\times}8{\times}8$ (36\,MiB) and reaches 288\,MiB at
-$V=16{\times}16{\times}16{\times}16$.  The compiler therefore checks the fused
+$8V\!\cdot\!144\!\cdot\!8$ bytes (complex entries stored as a pair of
+float32 reals).  This already exceeds the 14.4\,MiB NeuronCore on-chip
+SRAM at $V=16{\times}8{\times}8{\times}8$ (72\,MiB) and reaches
+576\,MiB at $V=16{\times}16{\times}16{\times}16$.  The compiler therefore checks the fused
 footprint against a configurable SRAM threshold before tracing; if the
 budget is exceeded it issues a warning and falls back to the unfused
 baked-gauge path, preserving correctness at reduced MXU efficiency.
@@ -316,7 +328,11 @@ the optimised Neuron path has not yet overcome the dispatch and
 bandwidth bottleneck at that volume.  GFLOP/s and GB/s are derived
 from the Multicore column (1320 flop/site~\cite{Babich:2011np};
 streaming spinor in${+}$out, BF16; gauge baked, no PCIe traffic for
-$U$).  $\dagger$~Fused kernels exceed the
+$U$). For context, NeuronCore-v2 BF16 peak is
+$\sim\!95$\,TFLOP/s per core and HBM bandwidth is
+$\sim\!400$\,GB/s per chip, so the sustained figures correspond to
+$\lesssim 10^{-4}$ of compute peak and $\lesssim 10^{-3}$ of memory peak.
+$\dagger$~Fused kernels exceed the
 14.4\,MiB NeuronCore SRAM budget at this volume; the compiler
 automatically falls back to the unfused baked-gauge path.}
 \label{tab:bench}
@@ -331,7 +347,7 @@ $4{\times}4{\times}4{\times}4$           &  804.6 & 1358.0 &  8521.5 & \textbf{1
 $8{\times}4{\times}4{\times}4$           &  769.5 &  785.1 &  4786.3 &  \textbf{7519.1} &  $9.8\times$ & 5.08 & 0.37 \\
 $8{\times}8{\times}4{\times}4$           &  518.1 &  370.1 &  2511.1 &  \textbf{4229.5} &  $8.2\times$ & 5.72 & 0.42 \\
 $8{\times}8{\times}8{\times}4$           &  384.0 &  207.6 &  1390.1 &  \textbf{2474.2} &  $6.4\times$ & 6.69 & 0.49 \\
-$16{\times}8{\times}8{\times}8$          &  229.2 &   37.2 &   253.8 &            220.1 & $1.0\times^\dagger$ & 2.38 & 0.17 \\
+$V=16{\times}8{\times}8{\times}8$          &  229.2 &   37.2 &   253.8 &            220.1 & $0.96\times^\dagger$ & 2.38 & 0.17 \\
 $16{\times}16{\times}16{\times}16$       &   59.6 &    1.2 &    24.4 &             15.8 & $0.3\times^\dagger$ & 1.36 & 0.10 \\
 \bottomrule
 \end{tabular}
@@ -353,10 +369,12 @@ underlying $3{\times}3$ / $4{\times}4$ einsums leave the MXU idle.
 Second, multi-RHS batching closes the gap and overtakes CPU at all
 volumes up to $V=8{\times}8{\times}8{\times}4$, but reaches only CPU parity at
 $V=16{\times}8{\times}8{\times}8$ ($1.0\times$ with Multicore)$^\dagger$ and falls
-clearly below at $V=16{\times}16{\times}16{\times}16$ ($0.3\times$ with Multicore)$^\dagger$.
+clearly below at $V=16{\times}16{\times}16{\times}16$ ($0.3\times$ with Multicore)$^\dagger$;
+at $V=16{\times}8{\times}8{\times}8$ Multicore reaches $0.96\times$\,CPU,
+which we describe as parity to one significant figure.
 At both large volumes the fused $12{\times}12$ kernel buffers alone
-exceed the 14.4\,MiB NeuronCore on-chip SRAM (36\,MiB at
-$16{\times}8{\times}8{\times}8$ and 288\,MiB at $16{\times}16{\times}16{\times}16$), so the
+exceed the 14.4\,MiB NeuronCore on-chip SRAM (72\,MiB at
+$16{\times}8{\times}8{\times}8$ and 576\,MiB at $16{\times}16{\times}16{\times}16$), so the
 compiler automatically falls back to the unfused baked-gauge path,
 eliminating the MXU-utilisation benefit of the fused kernels.
 Third, the two-core \texttt{DataParallel} (Multicore) configuration
@@ -426,8 +444,15 @@ Clover-Wilson Lattice QCD, and that with four straightforward
 graph-level optimisations - gauge baking, fused $12{\times}12$
 spin--colour kernels, multi-RHS batching, and multi-core
 \texttt{DataParallel} sharding - a pure-Python library with no
-custom kernel code reaches up to $10.9\times$ over a tuned CPU
-baseline on $V=4{\times}4{\times}4{\times}4$ in BF16.
+custom kernel code reaches up to $13.0\times$ over a tuned CPU
+baseline on $V=4{\times}4{\times}4{\times}4$ in BF16, with CPU parity
+at $V=16{\times}8{\times}8{\times}8$ and a sustained throughput that
+remains far below both NeuronCore peak and published QUDA numbers.
+Closing that gap will require even-odd preconditioning, SU(3)
+reconstruction to relieve memory pressure, and an SRAM-aware tiled
+fused kernel; the present paper is best read as a feasibility report
+establishing the programming model rather than a competitive
+implementation.
 
 \section*{Acknowledgments}
 The author thanks the AWS Neuron SDK team for documentation and
@@ -495,6 +520,12 @@ see also F.~Berruto \emph{et al.}, Phys.\ Rev.\ D \textbf{73}, 014503 (2006).
 M.~R.~Hestenes and E.~Stiefel,
 \emph{Methods of conjugate gradients for solving linear systems},
 J.\ Res.\ Natl.\ Bur.\ Stand.\ \textbf{49}, 409 (1952).
+
+\bibitem{vanderVorst}
+H.~A.~van der Vorst,
+\emph{Bi-CGSTAB: A fast and smoothly converging variant of Bi-CG
+for the solution of nonsymmetric linear systems},
+SIAM J.\ Sci.\ Stat.\ Comput.\ \textbf{13}, 631 (1992).
 
 \bibitem{Kogut:1974ag}
 J.~B.~Kogut and L.~Susskind,
