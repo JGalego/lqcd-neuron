@@ -57,7 +57,7 @@ User Python code
 | **Neuron utilities** | `NeuronCompiler`             | `torch_neuronx.trace` wrapper; gauge-baking + fused kernels |
 |                      | `compile_dslash_batched`     | Multi-RHS Dslash compilation for amortised dispatch |
 |                      | `compile_dslash_multicore`   | Data-parallel Dslash sharded across all NeuronCores |
-|                      | `compile_dslash_sharded`     | T-axis spatial sharding for V > 24⁴ (per-NEFF HLO budget) |
+|                      | `compile_dslash_sharded`     | T-axis spatial sharding for V > ~150k sites (per-NEFF HLO budget) |
 |                      | `NeuronDevice`               | Hardware detection (Trn1 / Inf2 / CPU fallback)    |
 
 
@@ -199,10 +199,10 @@ Three compile-time optimisations make this possible:
 5. **Spatial sharding (T-axis)** — `compile_dslash_sharded(…, num_shards=k)`
    splits the lattice along T into *k* slabs and compiles one NEFF per slab,
    bringing per-graph HLO instruction counts back under the `neuronx-cc`
-   ~5M budget for $V > 24^4$ where the single-NEFF compile would otherwise
-   abort with `[NCC_EVRF007]`.  Halos are gathered host-side under periodic
-   BCs.  `compile_dslash` auto-routes through this path when the volume
-   exceeds the per-NEFF cap.
+   ~5M budget for $V \gtrsim 1.5\times 10^5$ sites where the single-NEFF
+   compile would otherwise abort with `[NCC_EVRF007]`.  Halos are gathered
+   host-side under periodic BCs.  `compile_dslash` auto-routes through this
+   path when the volume exceeds the per-NEFF cap.
 
 Reproduce locally with:
 

@@ -100,10 +100,11 @@ def test_sharded_rejects_non_divisible_T():
 @pytest.mark.parametrize(
     "shape,expected",
     [
-        ((4, 4, 4, 4), 1),       # V=256 well below cap
-        ((24, 24, 24, 24), 1),   # V=24^4 right at cap → no shard needed
-        ((32, 32, 32, 32), 4),   # V=32^4 → V_local=24^4-ish at n=4
-        ((48, 32, 32, 32), 8),   # V=2.36M → n=8 brings V_local to ~295k
+        ((4, 4, 4, 4), 1),         # V=256 well below cap
+        ((16, 16, 16, 16), 1),     # V=65,536 below cap → no shard needed
+        ((24, 24, 24, 24), 4),     # V=331,776 → V_local=82,944 at n=4
+        ((32, 32, 32, 32), 8),     # V=1,048,576 → V_local=131,072 at n=8
+        ((48, 32, 32, 32), 16),    # V=2,359,296 → V_local=147,456 at n=16
     ],
 )
 def test_auto_num_shards(shape, expected):

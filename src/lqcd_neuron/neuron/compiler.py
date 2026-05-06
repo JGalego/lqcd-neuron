@@ -1118,11 +1118,19 @@ class _ShardedDslashWrapper(nn.Module):
         return torch.complex(out_re, out_im)
 
 
-# Default per-shard volume cap.  Empirically 24^4 = 331,776 sites is the
-# largest single-NEFF compile that fits the neuronx-cc ~5M HLO instruction
-# budget for the unfused baked-gauge Dslash; 32^4 (~1.05M sites) overshoots
-# by ~7×.  Used to auto-pick num_shards when callers don't specify.
-_DEFAULT_SHARD_VOLUME_CAP = 24 ** 4
+# Default per-shard volume cap.  Measured at --optlevel=1 the unfused
+# baked-gauge Dslash emits ~32 HLO instructions per site, so the
+# neuronx-cc ~5M HLO budget translates to ≈156k sites per NEFF.  Two
+# data points pinning that ratio:
+#
+#   V = 1,048,576 (32^4)              → 33.78M HLO  (~32.2 insn/site)
+#   V =   262,144 (8×32×32×32 shard)  →  8.44M HLO  (~32.2 insn/site)
+#
+# We use 150,000 — slightly under the budget — for headroom against the
+# "typical limit" wording in NCC_EVRF007 and against the small overhead
+# of the halo cat splices.  Used to auto-pick num_shards when callers
+# don't specify.
+_DEFAULT_SHARD_VOLUME_CAP = 150_000
 
 
 def _auto_num_shards(lattice_shape: Tuple[int, int, int, int]) -> int:

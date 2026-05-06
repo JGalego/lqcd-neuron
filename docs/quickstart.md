@@ -221,7 +221,8 @@ batching: each core still runs the fused 12×12 batched kernel on its
 
 ### Large lattices (V > 24⁴): spatial sharding
 
-At $V \gtrsim 24^4$ the single-NEFF graph overflows the `neuronx-cc` HLO
+At $V \gtrsim 1.5\times 10^5$ sites the single-NEFF graph overflows the
+`neuronx-cc` HLO
 instruction budget (`[NCC_EVRF007]`).  `compile_dslash` detects this and
 auto-routes through `compile_dslash_sharded`, which splits the lattice
 along the T axis into `num_shards` slabs and compiles one NEFF per slab.
@@ -229,7 +230,7 @@ Halos are gathered host-side under periodic BCs.  No call-site change is
 needed:
 
 ```python
-# 32^4 — auto-shards into 4 slabs of (T_local=8, 32, 32, 32)
+# 32^4 — auto-shards into 8 slabs of (T_local=4, 32, 32, 32)
 D_big = compiler.compile_dslash(
     D, lattice_shape=(32, 32, 32, 32),
     nc=geom.nc, gauge_field=U_big.tensor,
@@ -243,8 +244,8 @@ To control the partition explicitly:
 D_big = compiler.compile_dslash_sharded(
     D, lattice_shape=(32, 32, 32, 32),
     gauge_field=U_big.tensor,
-    num_shards=4,        # must divide T; default picks the smallest
-                         # power-of-2 keeping V_local ≤ 24^4
+    num_shards=8,        # must divide T; default picks the smallest
+                         # power-of-2 keeping V_local ≲ 150k sites
     nc=geom.nc,
 )
 ```

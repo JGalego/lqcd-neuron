@@ -246,7 +246,8 @@ path.
 
 ### 5. Spatial sharding (T-axis domain decomposition)
 
-Large lattices ($V \gtrsim 24^4 \approx 3.3 \times 10^5$ sites) overflow
+Large lattices ($V \gtrsim 1.5\times 10^5$ sites, e.g. anything beyond
+$\sim 16^4$ on three equal axes) overflow
 the per-NEFF `neuronx-cc` HLO instruction budget (~5M instructions,
 [NCC_EVRF007]) even with the unfused baked-gauge path.  At $32^4$ the
 unfused graph emits ~34M HLO instructions — about $7\times$ the budget —
@@ -259,7 +260,11 @@ Each shard compiles to its own NEFF operating on a
 $(T_\text{local}, Z, Y, X)$ sub-volume — the same per-graph instruction
 count as a single-shard compile of that smaller volume.  When `num_shards`
 is omitted the smallest power-of-2 factor of $T$ that satisfies
-$V_\text{local} \le 24^4$ is selected automatically.
+$V_\text{local} \le 1.5\times 10^5$ sites is selected automatically.  The
+cap is calibrated against the empirically measured ~32 HLO instructions
+per site that the unfused baked-gauge graph emits at `--optlevel=1`
+($V = 32^4$ produces 33.78M HLO; one quarter-shard at $8\times 32^3$
+produces 8.44M — both at ~32.2 insn/site).
 
 *Halo exchange.*  $Z$, $Y$, $X$ axes stay local to each shard and use
 ordinary `torch.roll`.  For the sharded $T$ axis the boundary neighbours
@@ -280,7 +285,8 @@ backward-$T$ hop at $t_\text{local}=0$ is computed without needing the
 previous shard's full gauge field.
 
 *Auto-routing.*  `compile_dslash` checks the global volume after deciding
-between fused and unfused, and when $V > 24^4$ in the unfused branch it
+between fused and unfused, and when $V > 1.5\times 10^5$ sites in the
+unfused branch it
 silently delegates to `compile_dslash_sharded` with the auto-picked
 `num_shards`.  The user's existing `forward(psi, U)` call site keeps
 working unchanged.
