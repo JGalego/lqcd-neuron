@@ -225,6 +225,7 @@ bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral]
 # ---------------------------------------------------------------------------
 # Inspect partial results streamed by an in-flight bench-job to S3.
 #   make bench-runs                       # list runs in the bucket
+#   make bench-tail                       # average results across ALL runs
 #   make bench-tail RUN=<run_id>          # per-lattice results as a table
 #   make bench-tail RUN=<run_id> RAW=1    # raw JSONL (one line per entry)
 #   make bench-tail RUN=<run_id> LOG=1    # tail the running bench.log
@@ -309,19 +310,96 @@ for row, raw in zip(data, rows):
 endef
 export _BENCH_TAIL_PY
 
+# Aggregator: group records by (label, B) and average the throughput
+# columns across runs.  Used when `make bench-tail` is invoked without RUN.
+define _BENCH_AVG_PY
+import collections, json, sys
+
+THROUGHPUT_KEYS = ("cpu", "neuron", "batched", "multicore")
+groups = collections.OrderedDict()
+runs = set()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if "run_id" in r:
+        runs.add(r["run_id"])
+    key = (r.get("label", ""), r.get("B", ""))
+    g = groups.setdefault(key, {
+        "label": key[0], "B": key[1],
+        "_sum": collections.defaultdict(float),
+        "_n":   collections.defaultdict(int),
+        "_count": 0,
+    })
+    g["_count"] += 1
+    for k in THROUGHPUT_KEYS:
+        v = r.get(k)
+        if isinstance(v, (int, float)):
+            g["_sum"][k] += v
+            g["_n"][k]   += 1
+
+def _vol(label):
+    try:
+        return [int(x) for x in str(label).split("x")]
+    except (TypeError, ValueError):
+        return [0]
+
+print(f"# averaged across {len(runs) or '?'} run(s), {sum(g['_count'] for g in groups.values())} record(s)",
+      file=sys.stderr)
+
+for key in sorted(groups, key=lambda k: (_vol(k[0]), k[1] if isinstance(k[1], int) else 0)):
+    g = groups[key]
+    out = {"t_utc": "", "label": g["label"], "B": g["B"]}
+    for k in THROUGHPUT_KEYS:
+        if g["_n"][k]:
+            out[k] = g["_sum"][k] / g["_n"][k]
+    out["note"] = f"avg(n={g['_count']})"
+    print(json.dumps(out))
+endef
+export _BENCH_AVG_PY
+
 .PHONY: bench-tail
-bench-tail:  ## Tail partial results of an in-flight run [RUN=<id>] [RAW=1] [LOG=1]
-	@if [ -z "$(RUN)" ]; then echo "Usage: make bench-tail RUN=<run_id> [RAW=1] [LOG=1]"; exit 2; fi
-	@if [ "$(LOG)" = "1" ]; then \
-	    aws s3 cp --region $(_BENCH_REGION) \
-	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/bench.log.partial" -; \
-	elif [ "$(RAW)" = "1" ]; then \
-	    aws s3 cp --region $(_BENCH_REGION) \
-	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/partial/results.jsonl" -; \
+bench-tail:  ## Tail partial results [no RUN: avg across all runs] [RUN=<id>] [RAW=1] [LOG=1]
+	@if [ "$(LOG)" = "1" ] && [ -z "$(RUN)" ]; then \
+	    echo "LOG=1 requires RUN=<run_id>"; exit 2; \
+	fi
+	@if [ -n "$(RUN)" ]; then \
+	    if [ "$(LOG)" = "1" ]; then \
+	        aws s3 cp --region $(_BENCH_REGION) \
+	            "s3://$(_BENCH_BUCKET)/runs/$(RUN)/bench.log.partial" -; \
+	    elif [ "$(RAW)" = "1" ]; then \
+	        aws s3 cp --region $(_BENCH_REGION) \
+	            "s3://$(_BENCH_BUCKET)/runs/$(RUN)/partial/results.jsonl" -; \
+	    else \
+	        aws s3 cp --region $(_BENCH_REGION) \
+	            "s3://$(_BENCH_BUCKET)/runs/$(RUN)/partial/results.jsonl" - \
+	        | python3 -c "$$_BENCH_TAIL_PY"; \
+	    fi; \
 	else \
-	    aws s3 cp --region $(_BENCH_REGION) \
-	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/partial/results.jsonl" - \
-	    | python3 -c "$$_BENCH_TAIL_PY"; \
+	    runs=$$(aws s3 ls --region $(_BENCH_REGION) "s3://$(_BENCH_BUCKET)/runs/" \
+	        | awk '/PRE / {gsub("/","",$$2); print $$2}'); \
+	    if [ -z "$$runs" ]; then echo "(no runs in bucket)"; exit 0; fi; \
+	    tmp=$$(mktemp); \
+	    trap 'rm -f $$tmp' EXIT; \
+	    for r in $$runs; do \
+	        aws s3 cp --region $(_BENCH_REGION) \
+	            "s3://$(_BENCH_BUCKET)/runs/$$r/partial/results.jsonl" - \
+	            2>/dev/null >> $$tmp || true; \
+	    done; \
+	    if [ ! -s $$tmp ]; then \
+	        echo "(no partial results found across $$(echo $$runs | wc -w) run(s))"; \
+	        exit 0; \
+	    fi; \
+	    if [ "$(RAW)" = "1" ]; then \
+	        python3 -c "$$_BENCH_AVG_PY" < $$tmp; \
+	    else \
+	        python3 -c "$$_BENCH_AVG_PY" < $$tmp | python3 -c "$$_BENCH_TAIL_PY"; \
+	    fi; \
 	fi
 
 .PHONY: tfvars

@@ -974,6 +974,26 @@ class NeuronCompiler:
         # Set compiler environment flags
         os.environ.setdefault("NEURON_CC_FLAGS", f"--optlevel {self.optimize_level}")
 
+        # Log the equivalent neuronx-cc invocation for transparency / debugging.
+        # torch_neuronx.trace serialises the traced graph to a temporary HLO and
+        # invokes `neuronx-cc compile <hlo> --framework XLA <NEURON_CC_FLAGS>`
+        # under the hood.  We surface the flags and input signature here.
+        def _sig(t: Any) -> str:
+            if isinstance(t, torch.Tensor):
+                return f"{tuple(t.shape)}:{str(t.dtype).replace('torch.', '')}"
+            if isinstance(t, (list, tuple)):
+                return "(" + ", ".join(_sig(x) for x in t) + ")"
+            return type(t).__name__
+
+        cc_flags = os.environ.get("NEURON_CC_FLAGS", "")
+        logger.info(
+            "neuronx-cc compile <traced-hlo> --framework XLA %s  "
+            "# model=%s inputs=%s",
+            cc_flags,
+            type(model).__name__,
+            _sig(example_inputs),
+        )
+
         compiled = torch_neuronx.trace(model, example_inputs)
 
         if cache_key:
