@@ -84,6 +84,33 @@ BENCH_ITERS  = 50
 DEFAULT_BATCH_SIZES = [8, 16, 32]
 
 
+def _compile_info(module) -> dict:
+    """Pull the optimizer-path provenance dict stamped by NeuronCompiler."""
+    return dict(getattr(module, "lqcd_compile_info", {}) or {})
+
+
+def _fmt_mode(info: dict) -> str:
+    """Render a compact one-token tag for the table 'Mode' column.
+
+    Examples:
+        fused           — fused per-site (Ns·Nc)² kernels
+        unfused         — baked raw gauge, einsum spin/colour in the graph
+        unfused*        — fused requested, auto-fell back to unfused
+        sharded(N=4)    — T-axis split across 4 NEFFs
+        sharded*(N=4)   — fused requested but auto-routed via sharding
+        cpu             — Neuron unavailable, CPU fallback
+    """
+    if not info:
+        return "?"
+    kernel = info.get("kernel", "?")
+    fb_fused = info.get("fused_fallback", False)
+    fb_sharded = info.get("sharded_fallback", False)
+    suffix = "*" if (fb_fused or fb_sharded) else ""
+    if kernel == "sharded":
+        return f"sharded{suffix}(N={info.get('num_shards', '?')})"
+    return f"{kernel}{suffix}"
+
+
 def benchmark_one(
     matvec,
     psi: torch.Tensor,
@@ -200,6 +227,13 @@ def _emit_partial(entry: dict) -> None:
         e = dict(entry)
         if isinstance(e.get("shape"), tuple):
             e["shape"] = list(e["shape"])
+        # compile_info dicts may contain tuple lattice_shape — normalise.
+        for k in ("neuron_info", "batched_info", "multicore_info"):
+            v = e.get(k)
+            if isinstance(v, dict) and isinstance(v.get("lattice_shape"), tuple):
+                v = dict(v)
+                v["lattice_shape"] = list(v["lattice_shape"])
+                e[k] = v
         # add wallclock so consumers can see when each lattice landed
         e["t_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         with open(jsonl_path, "a") as f:
@@ -293,6 +327,9 @@ def run(
             # the batch size — measure them once per shape and reuse.
             cpu_aps = benchmark_one(D.forward, psi, U, label="CPU")
             neuron_aps = float("nan")
+            neuron_info: dict = {}
+            batched_info: dict = {}
+            multicore_info: dict = {}
             neuron_error: Optional[str] = None
 
             if use_neuron:
@@ -300,6 +337,7 @@ def run(
                     D_n = compiler.compile_dslash(
                         D, shape, nc=nc, gauge_field=U, fused=fused,
                     )
+                    neuron_info = _compile_info(D_n)
                     neuron_aps = benchmark_one(D_n, psi, U, label="Neuron")
                 except (RuntimeError, MemoryError) as e:
                     neuron_error = f"{type(e).__name__}: {e}"
@@ -321,6 +359,8 @@ def run(
                     continue
 
                 entry["neuron"] = neuron_aps
+                if neuron_info:
+                    entry["neuron_info"] = neuron_info
 
                 # The Batched/Multicore paths currently always use the
                 # fused kernel — skip them when running an unfused A/B
@@ -333,8 +373,11 @@ def run(
                     D_b = compiler.compile_dslash_batched(
                         D, shape, batch_size=B, gauge_field=U, nc=nc
                     )
+                    batched_info = _compile_info(D_b)
                     psi_batch = psi.unsqueeze(0).expand(B, *psi.shape).contiguous()
                     entry["batched"] = benchmark_batched(D_b, psi_batch)
+                    if batched_info:
+                        entry["batched_info"] = batched_info
 
                     if show_multicore:
                         mc_batch = num_cores * B
@@ -342,8 +385,11 @@ def run(
                             D, shape, gauge_field=U, num_cores=num_cores,
                             per_core_batch_size=B, nc=nc,
                         )
+                        multicore_info = _compile_info(D_mc)
                         psi_mc = psi.unsqueeze(0).expand(mc_batch, *psi.shape).contiguous()
                         entry["multicore"] = benchmark_batched(D_mc, psi_mc)
+                        if multicore_info:
+                            entry["multicore_info"] = multicore_info
                 except (RuntimeError, MemoryError) as e:
                     # Batched/multicore compile or HBM failure — keep the
                     # per-batch row but flag it.
@@ -364,7 +410,8 @@ def run(
             cols.append(f"{'Batched':>14}")
             if show_multicore:
                 cols.append(f"{'Multicore':>14}")
-        cols += [f"{'Speedup':>8}", f"{'GFLOP/s':>10}", f"{'GB/s':>8}"]
+        cols += [f"{'Speedup':>8}", f"{'GFLOP/s':>10}", f"{'GB/s':>8}",
+                 f"{'Mode':>16}"]
         header = "  ".join(cols)
         ruler  = "-" * len(header)
     else:
@@ -393,6 +440,15 @@ def run(
               f"(1320 flops/site, Babich et al. 2011)")
         print(f"    GB/s      = streaming spinor in+out, BF16 "
               f"(gauge baked, no PCIe traffic for U)")
+        print(f"    Mode      = compiler path actually taken for the Neuron "
+              f"column;")
+        print(f"                'fused' = per-site (Ns·Nc)² kernels, "
+              f"'unfused' = baked raw gauge,")
+        print(f"                'sharded(N=k)' = T-axis split across k NEFFs. "
+              f"A trailing '*'")
+        print(f"                marks an auto-fallback (e.g. fused→unfused on "
+              f"SRAM spill,")
+        print(f"                or unfused→sharded on HLO-budget overflow).")
     else:
         print(f"    GFLOP/s   = derived from CPU column (1320 flops/site)")
         print(f"    GB/s      = streaming spinor in+out, FP32")
@@ -431,6 +487,16 @@ def run(
                 if show_multicore:
                     line += f"  {entry.get('multicore', float('nan')):>14.1f}"
             line += f"  {speedup:>7.1f}x  {gflops:>10.2f}  {gbps:>8.2f}"
+            # Mode tag — prefer the column that drove the 'best' number,
+            # falling back to the single-RHS Neuron compile.
+            mode_info = (
+                entry.get("multicore_info")
+                if entry.get("multicore") is not None
+                else entry.get("batched_info")
+                if entry.get("batched") is not None
+                else entry.get("neuron_info")
+            ) or entry.get("neuron_info") or {}
+            line += f"  {_fmt_mode(mode_info):>16}"
             if "batched_error" in entry:
                 line += f"  [batched failed: {entry['batched_error']}]"
         elif not use_neuron:

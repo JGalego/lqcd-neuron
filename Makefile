@@ -269,7 +269,7 @@ def _colorize(status):
     if status == "STALE":
         return _c("1;35", status)         # bold magenta
     if status == "ABANDONED":
-        return _c("1;31", status)         # bold red
+        return _c("1;38;5;93", status)    # bold purple (256-color)
     if status == "UNKNOWN" or status.endswith("?"):
         return _c("1;90", status)         # bold gray
     return status

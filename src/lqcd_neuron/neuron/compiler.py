@@ -77,6 +77,46 @@ _NC2_SRAM_BYTES = 24 * 1024 * 1024   # 24 MiB NeuronCore-v2 SBUF
 _FUSED_SRAM_BUDGET = 0.60             # fraction of SBUF reserved for kernels
 
 
+# ---------------------------------------------------------------------------
+# Compile-path provenance
+# ---------------------------------------------------------------------------
+# Each ``compile_dslash*`` entry point stamps a small dict onto the module it
+# returns describing exactly which code path was selected and why.  This lets
+# benchmarks and integration tests record (and assert on) whether the fused
+# kernel was used, whether the SRAM-spill auto-fallback fired, whether the
+# T-axis sharded path was auto-routed, and the per-call batching / core
+# layout.  See ``examples/bench_dslash.py`` for the standard consumer.
+#
+# Stable keys (forward-compatible additions allowed; consumers should
+# tolerate missing keys):
+#
+#   kernel            : "fused" | "unfused" | "sharded" | "complex_in_graph"
+#                       | "half_lattice_eo" | "cpu"
+#   fused_kernel_mib  : float | None — size of the four K_fwd/K_bwd buffers
+#   sram_budget_mib   : float | None — SRAM threshold used for the check
+#   fused_fallback    : bool         — fused→unfused auto-downgrade fired
+#   sharded_fallback  : bool         — unfused→sharded auto-route fired
+#   num_shards        : int          — 1 unless sharded
+#   T_local           : int          — full T unless sharded
+#   batch_size        : int          — RHS per call (1 single-RHS)
+#   num_cores         : int          — 1 unless multicore
+#   lattice_shape     : tuple[int,int,int,int]
+
+def _attach_compile_info(module: nn.Module, **info: Any) -> nn.Module:
+    """Stamp ``lqcd_compile_info`` on *module*; safe if attribute is rejected."""
+    try:
+        existing = getattr(module, "lqcd_compile_info", None) or {}
+        merged = {**existing, **info}
+        # ``object.__setattr__`` bypasses nn.Module's parameter/buffer registry,
+        # so the dict is stored as a plain Python attribute even on subclasses
+        # with custom __setattr__.  ScriptModules reject new attributes — those
+        # are wrapped in our own nn.Module shims, so this works in practice.
+        object.__setattr__(module, "lqcd_compile_info", merged)
+    except (AttributeError, RuntimeError):
+        pass
+    return module
+
+
 def _fused_kernel_bytes(
     lattice_shape: Tuple[int, int, int, int],
     ns: int = 4,
@@ -1380,7 +1420,17 @@ class NeuronCompiler:
             logger.info(
                 "No Neuron hardware detected — returning PyTorch CPU module."
             )
-            return dslash_module
+            return _attach_compile_info(
+                dslash_module,
+                kernel="cpu",
+                lattice_shape=tuple(lattice_shape),
+                batch_size=1,
+                num_cores=1,
+                num_shards=1,
+                T_local=lattice_shape[0],
+                fused_fallback=False,
+                sharded_fallback=False,
+            )
 
         if isinstance(dslash_module, WilsonDirac):
             adapter: nn.Module = _NeuronWilsonDiracAdapter(
@@ -1404,6 +1454,13 @@ class NeuronCompiler:
         cpu = torch.device("cpu")
 
         if gauge_field is not None:
+            # Track which auto-downgrades fired so the returned module's
+            # compile_info reflects the *actual* path executed at runtime.
+            fused_fallback = False
+            sharded_fallback = False
+            fused_kernel_mib: Optional[float] = None
+            sram_budget_mib: Optional[float] = None
+
             # Auto-fallback: if the fused per-site (Ns×Nc)² kernels would
             # overflow NeuronCore SRAM, use the unfused baked-gauge path
             # instead.  The unfused path has ~12× smaller on-chip working set
@@ -1415,6 +1472,8 @@ class NeuronCompiler:
                     or int(_NC2_SRAM_BYTES * _FUSED_SRAM_BUDGET)
                 )
                 kb = _fused_kernel_bytes(lattice_shape, ns=ns, nc=nc, dtype=dt)
+                fused_kernel_mib = kb / 1024**2
+                sram_budget_mib = sram_budget / 1024**2
                 if kb > sram_budget:
                     if not self.allow_fused_fallback:
                         raise RuntimeError(
@@ -1439,6 +1498,7 @@ class NeuronCompiler:
                         lattice_shape,
                     )
                     fused = False
+                    fused_fallback = True
 
             if not fused:
                 # Bake the gauge field as raw (T,Z,Y,X,4,Nc,Nc) buffers but
@@ -1462,9 +1522,16 @@ class NeuronCompiler:
                         T * Z * Y * X, _DEFAULT_SHARD_VOLUME_CAP,
                         auto_n, T // auto_n,
                     )
-                    return self.compile_dslash_sharded(
+                    sharded = self.compile_dslash_sharded(
                         dslash_module, lattice_shape, gauge_field,
                         num_shards=auto_n, nc=nc, ns=ns,
+                    )
+                    return _attach_compile_info(
+                        sharded,
+                        sharded_fallback=True,
+                        fused_fallback=fused_fallback,
+                        fused_kernel_mib=fused_kernel_mib,
+                        sram_budget_mib=sram_budget_mib,
                     )
 
                 adapter = adapter.to(dt)
@@ -1475,7 +1542,19 @@ class NeuronCompiler:
                 psi_im = torch.zeros_like(psi_re)
                 # No cache key — NEFF embeds this specific gauge configuration.
                 compiled = self.compile(baked, (psi_re, psi_im))
-                return _BakedGaugeDslashWrapper(compiled, compute_dtype=dt)
+                return _attach_compile_info(
+                    _BakedGaugeDslashWrapper(compiled, compute_dtype=dt),
+                    kernel="unfused",
+                    lattice_shape=tuple(lattice_shape),
+                    fused_kernel_mib=fused_kernel_mib,
+                    sram_budget_mib=sram_budget_mib,
+                    fused_fallback=fused_fallback,
+                    sharded_fallback=False,
+                    num_shards=1,
+                    T_local=T,
+                    batch_size=1,
+                    num_cores=1,
+                )
 
             # Bake the gauge field into the compiled model as fused per-site,
             # per-direction (Ns*Nc)×(Ns*Nc) hopping kernels.  At runtime each
@@ -1497,7 +1576,19 @@ class NeuronCompiler:
             psi_im = torch.zeros_like(psi_re)
             # No cache key — the NEFF embeds this specific gauge configuration.
             compiled = self.compile(fused, (psi_re, psi_im))
-            return _FusedDslashWrapper(compiled, compute_dtype=dt)
+            return _attach_compile_info(
+                _FusedDslashWrapper(compiled, compute_dtype=dt),
+                kernel="fused",
+                lattice_shape=tuple(lattice_shape),
+                fused_kernel_mib=fused_kernel_mib,
+                sram_budget_mib=sram_budget_mib,
+                fused_fallback=False,
+                sharded_fallback=False,
+                num_shards=1,
+                T_local=T,
+                batch_size=1,
+                num_cores=1,
+            )
 
         adapter = adapter.to(dt)
         psi_re = torch.zeros(T, Z, Y, X, ns, nc, dtype=dt, device=cpu)
@@ -1507,7 +1598,17 @@ class NeuronCompiler:
 
         key = f"dslash_{type(dslash_module).__name__}_{lattice_shape}_{nc}_{dt}"
         compiled = self.compile(adapter, (psi_re, psi_im, U_re, U_im), cache_key=key)
-        return _ComplexDslashWrapper(compiled, compute_dtype=dt)
+        return _attach_compile_info(
+            _ComplexDslashWrapper(compiled, compute_dtype=dt),
+            kernel="complex_in_graph",
+            lattice_shape=tuple(lattice_shape),
+            fused_fallback=False,
+            sharded_fallback=False,
+            num_shards=1,
+            T_local=T,
+            batch_size=1,
+            num_cores=1,
+        )
 
     def compile_dslash_batched(
         self,
@@ -1598,7 +1699,17 @@ class NeuronCompiler:
         psi_im = torch.zeros_like(psi_re)
         # No cache key — the NEFF embeds this specific gauge configuration.
         compiled = self.compile(fused, (psi_re, psi_im))
-        return _FusedBatchedDslashWrapper(compiled, compute_dtype=dt)
+        return _attach_compile_info(
+            _FusedBatchedDslashWrapper(compiled, compute_dtype=dt),
+            kernel="fused",
+            lattice_shape=tuple(lattice_shape),
+            fused_fallback=False,
+            sharded_fallback=False,
+            num_shards=1,
+            T_local=T,
+            batch_size=int(batch_size),
+            num_cores=1,
+        )
 
     def compile_dslash_eo(
         self,
@@ -1680,7 +1791,18 @@ class NeuronCompiler:
         psi_re = torch.zeros(T, Z, Y, X // 2, ns, nc, dtype=dt, device=cpu)
         psi_im = torch.zeros_like(psi_re)
         compiled = self.compile(adapter, (psi_re, psi_im))
-        return _HalfLatticeDslashWrapper(compiled, compute_dtype=dt)
+        return _attach_compile_info(
+            _HalfLatticeDslashWrapper(compiled, compute_dtype=dt),
+            kernel="half_lattice_eo",
+            lattice_shape=tuple(lattice_shape),
+            out_parity=int(out_parity),
+            fused_fallback=False,
+            sharded_fallback=False,
+            num_shards=1,
+            T_local=T,
+            batch_size=1,
+            num_cores=1,
+        )
 
     def compile_dslash_sharded(
         self,
@@ -1783,11 +1905,21 @@ class NeuronCompiler:
             )
             shard_modules.append(compiled)
 
-        return _ShardedDslashWrapper(
-            shard_modules,
-            num_shards=num_shards,
-            T_local=T_local,
-            compute_dtype=dt,
+        return _attach_compile_info(
+            _ShardedDslashWrapper(
+                shard_modules,
+                num_shards=num_shards,
+                T_local=T_local,
+                compute_dtype=dt,
+            ),
+            kernel="sharded",
+            lattice_shape=tuple(lattice_shape),
+            fused_fallback=False,
+            sharded_fallback=False,
+            num_shards=int(num_shards),
+            T_local=int(T_local),
+            batch_size=1,
+            num_cores=1,
         )
 
     def compile_observable(
@@ -2002,11 +2134,21 @@ class NeuronCompiler:
         psi_im = torch.zeros_like(psi_re)
 
         parallel = self.compile_multicore(fused, (psi_re, psi_im), num_cores=num_cores)
-        return _MultiCoreDslashWrapper(
-            parallel,
-            compute_dtype=dt,
-            num_cores=num_cores,
-            per_core_batch_size=per_core_batch_size,
+        return _attach_compile_info(
+            _MultiCoreDslashWrapper(
+                parallel,
+                compute_dtype=dt,
+                num_cores=num_cores,
+                per_core_batch_size=per_core_batch_size,
+            ),
+            kernel="fused",
+            lattice_shape=tuple(lattice_shape),
+            fused_fallback=False,
+            sharded_fallback=False,
+            num_shards=1,
+            T_local=T,
+            batch_size=int(per_core_batch_size),
+            num_cores=int(num_cores),
         )
 
     # ------------------------------------------------------------------
