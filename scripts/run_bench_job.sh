@@ -230,6 +230,8 @@ log "Done."
 # ---------------------------------------------------------------------------
 if [[ "${EPHEMERAL}" == "1" ]]; then
     log "EPHEMERAL=1 — shutting down (instance is configured to terminate)."
+    # Cancel the user-data wallclock kill switch; our own +1 schedule wins.
+    sudo shutdown -c >/dev/null 2>&1 || true
     sudo shutdown -h +1 "lqcd-neuron bench job complete" || true
 fi
 

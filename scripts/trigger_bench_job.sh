@@ -57,6 +57,38 @@ command -v aws >/dev/null 2>&1 || {
     echo "ERROR: AWS CLI v2 is required." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+# Pre-flight: refuse to launch with a dirty tree or unpushed commits.
+# The remote bench instance always pulls from origin/<branch>, so anything
+# that isn't pushed is invisible to it. Skip with LQCD_SKIP_GIT_CHECK=1.
+# ---------------------------------------------------------------------------
+if [[ "${LQCD_SKIP_GIT_CHECK:-0}" != "1" ]]; then
+    if ! git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        log "WARN: ${REPO_ROOT} is not a git checkout, skipping git pre-flight."
+    else
+        BRANCH_LOCAL="${LQCD_NEURON_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
+        if ! git -C "${REPO_ROOT}" diff --quiet \
+            || ! git -C "${REPO_ROOT}" diff --cached --quiet; then
+            echo "ERROR: working tree has uncommitted changes on '${BRANCH_LOCAL}'." >&2
+            echo "       Commit/stash them, or re-run with LQCD_SKIP_GIT_CHECK=1." >&2
+            exit 1
+        fi
+        log "Fetching origin/${BRANCH_LOCAL} to check for unpushed commits …"
+        if git -C "${REPO_ROOT}" fetch --quiet origin "${BRANCH_LOCAL}" 2>/dev/null; then
+            AHEAD=$(git -C "${REPO_ROOT}" rev-list --count "origin/${BRANCH_LOCAL}..HEAD" 2>/dev/null || echo 0)
+            if [[ "${AHEAD}" -gt 0 ]]; then
+                echo "ERROR: local '${BRANCH_LOCAL}' is ${AHEAD} commit(s) ahead of origin." >&2
+                echo "       Push first, or re-run with LQCD_SKIP_GIT_CHECK=1." >&2
+                git -C "${REPO_ROOT}" log --oneline "origin/${BRANCH_LOCAL}..HEAD" >&2 || true
+                exit 1
+            fi
+        else
+            log "WARN: could not fetch origin/${BRANCH_LOCAL}; skipping ahead-check."
+        fi
+        log "Git pre-flight OK (clean tree, no unpushed commits on ${BRANCH_LOCAL})."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Read OpenTofu outputs
 # ---------------------------------------------------------------------------
 AWS_REGION=$(tofu  -chdir="${INFRA_DIR}" output -raw aws_region)
@@ -181,14 +213,53 @@ Q_AWS_REGION=$(printf '%q' "${AWS_REGION}")
 Q_REPO_URL=$(printf  '%q' "${REPO_URL}")
 Q_BRANCH=$(printf    '%q' "${BRANCH}")
 
+# Embed the on-instance bench script directly so the ephemeral box does not
+# depend on the orchestration script being pushed (only the bench code does).
+SCRIPT_PATH="${REPO_ROOT}/scripts/run_bench_job.sh"
+[[ -f "${SCRIPT_PATH}" ]] || {
+    echo "ERROR: ${SCRIPT_PATH} missing" >&2; exit 1; }
+RUN_BENCH_JOB_SH=$(cat "${SCRIPT_PATH}")
+
 USER_DATA=$(cat <<EOF
 #!/bin/bash
-set -euo pipefail
 exec > >(tee /var/log/lqcd-bench-userdata.log) 2>&1
 echo "[user-data] starting at \$(date -u --iso-8601=seconds)"
 
+# Hard wallclock kill switch: no matter what wedges below, the instance
+# dies in 2 hours.  Cancellable from inside the workload via 'shutdown -c'
+# if a longer run is ever needed.
+shutdown -h +120 "lqcd-neuron bench wallclock" || true
+
+# Belt-and-braces teardown: fires on success, error, or signal.  Replaces
+# the old trailing 'shutdown' which 'set -e' could skip on bootstrap failure.
+_lqcd_teardown() {
+    rc=\$?
+    echo "[user-data] teardown rc=\${rc} at \$(date -u --iso-8601=seconds)"
+    if [[ "\${rc}" -ne 0 ]] && [[ "\${LQCD_SNS_NOTIFIED:-0}" != "1" ]]; then
+        # Bootstrap failed before run_bench_job.sh could publish a result.
+        # Send a short failure ping so the run is not silently lost.
+        aws sns publish \\
+            --region ${Q_AWS_REGION} \\
+            --topic-arn ${Q_SNS_ARN} \\
+            --subject "[lqcd-neuron] bench BOOTSTRAP FAILED (rc=\${rc})" \\
+            --message "\$(tail -c 8000 /var/log/lqcd-bench-userdata.log 2>/dev/null \\
+                || echo 'no log available')" >/dev/null 2>&1 || true
+    fi
+    shutdown -h +2 "lqcd-neuron ephemeral bench done" || true
+}
+trap _lqcd_teardown EXIT
+set -uo pipefail
+
 REPO_URL=${Q_REPO_URL}
 BRANCH=${Q_BRANCH}
+
+# Drop the embedded run_bench_job.sh in /tmp so it runs even if the
+# orchestration changes haven't been pushed to the remote branch yet.
+cat > /tmp/run_bench_job.sh <<'BENCH_EOF'
+${RUN_BENCH_JOB_SH}
+BENCH_EOF
+chmod +x /tmp/run_bench_job.sh
+chown ubuntu:ubuntu /tmp/run_bench_job.sh
 
 # Run the bench as the ubuntu user.  We clone the repo fresh so the
 # instance picks up whatever branch was requested at trigger time.
@@ -201,7 +272,7 @@ sudo -u ubuntu -H \\
     LQCD_NEURON_REPO_URL="\${REPO_URL}" \\
     GIT_BRANCH="\${BRANCH}" \\
     bash -c '
-        set -euo pipefail
+        set -uo pipefail
         cd "\$HOME"
         if [[ ! -d lqcd-neuron/.git ]]; then
             git clone --branch "\$GIT_BRANCH" "\$LQCD_NEURON_REPO_URL" lqcd-neuron
@@ -211,11 +282,15 @@ sudo -u ubuntu -H \\
         git checkout --quiet "\$GIT_BRANCH"
         git reset --hard "origin/\$GIT_BRANCH"
         export REPO_DIR="\$HOME/lqcd-neuron"
-        bash scripts/run_bench_job.sh
+        bash /tmp/run_bench_job.sh
     '
-
-# Belt-and-braces self-termination in case run_bench_job.sh's shutdown failed.
-shutdown -h +5 "lqcd-neuron ephemeral bench complete" || true
+BENCH_RC=\$?
+# run_bench_job.sh handles its own SNS publish on success or bench failure;
+# only the trap needs to fire for bootstrap-level failures.
+if [[ "\${BENCH_RC}" -le 1 ]]; then
+    export LQCD_SNS_NOTIFIED=1
+fi
+exit "\${BENCH_RC}"
 EOF
 )
 
