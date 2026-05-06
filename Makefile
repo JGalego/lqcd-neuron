@@ -218,6 +218,30 @@ bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral]
 	    $(if $(filter 1,$(WAIT)),--wait) \
 	    -- $(_JOB_FLAGS)
 
+# ---------------------------------------------------------------------------
+# Inspect partial results streamed by an in-flight bench-job to S3.
+#   make bench-runs                       # list runs in the bucket
+#   make bench-tail RUN=<run_id>          # tail per-lattice JSONL
+#   make bench-tail RUN=<run_id> LOG=1    # tail the running bench.log
+# ---------------------------------------------------------------------------
+_BENCH_BUCKET = $$(tofu -chdir=$(INFRA_DIR) output -raw bench_s3_bucket)
+_BENCH_REGION = $$(tofu -chdir=$(INFRA_DIR) output -raw aws_region)
+
+.PHONY: bench-runs
+bench-runs:  ## List bench runs uploaded to the S3 bucket
+	aws s3 ls --region $(_BENCH_REGION) "s3://$(_BENCH_BUCKET)/runs/"
+
+.PHONY: bench-tail
+bench-tail:  ## Tail partial results of an in-flight run [RUN=<id>] [LOG=1]
+	@if [ -z "$(RUN)" ]; then echo "Usage: make bench-tail RUN=<run_id> [LOG=1]"; exit 2; fi
+	@if [ "$(LOG)" = "1" ]; then \
+	    aws s3 cp --region $(_BENCH_REGION) \
+	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/bench.log.partial" -; \
+	else \
+	    aws s3 cp --region $(_BENCH_REGION) \
+	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/partial/results.jsonl" -; \
+	fi
+
 .PHONY: tfvars
 tvars:  ## Copy the example tfvars file (edit before running tofu-apply)
 	cp $(INFRA_DIR)/terraform.tfvars.example $(INFRA_DIR)/terraform.tfvars

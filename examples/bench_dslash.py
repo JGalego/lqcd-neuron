@@ -23,8 +23,10 @@ Output (example on Inf2):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from typing import List, Optional, Tuple
@@ -179,6 +181,48 @@ def _parse_batch_sizes(s: str) -> List[int]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Partial-result streaming
+# ---------------------------------------------------------------------------
+# When ``LQCD_BENCH_PARTIAL_DIR`` is set, each completed (lattice, batch_size)
+# entry is appended to ``<dir>/results.jsonl`` as soon as it's measured.  If
+# ``LQCD_BENCH_PARTIAL_S3`` is also set (e.g. ``s3://bucket/runs/<id>/partial/``),
+# the file is re-uploaded after every entry so the user can poll S3 for live
+# progress instead of waiting for the full sweep to finish.
+
+def _emit_partial(entry: dict) -> None:
+    pdir = os.environ.get("LQCD_BENCH_PARTIAL_DIR")
+    if not pdir:
+        return
+    try:
+        os.makedirs(pdir, exist_ok=True)
+        jsonl_path = os.path.join(pdir, "results.jsonl")
+        e = dict(entry)
+        if isinstance(e.get("shape"), tuple):
+            e["shape"] = list(e["shape"])
+        # add wallclock so consumers can see when each lattice landed
+        e["t_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(jsonl_path, "a") as f:
+            f.write(json.dumps(e) + "\n")
+    except OSError:
+        return
+
+    s3_prefix = os.environ.get("LQCD_BENCH_PARTIAL_S3")
+    if not s3_prefix:
+        return
+    s3_uri = s3_prefix.rstrip("/") + "/results.jsonl"
+    try:
+        subprocess.run(
+            ["aws", "s3", "cp", "--quiet", jsonl_path, s3_uri],
+            check=False, timeout=30,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Streaming partial results is best-effort — never fail the bench
+        # because S3 had a hiccup.
+        pass
+
+
 def run(
     use_neuron: bool,
     mass: float = 0.1,
@@ -214,6 +258,10 @@ def run(
     # ---- Collect results (compiler may emit messages here) ----
     results: list[dict] = []
 
+    def _record(entry: dict) -> None:
+        results.append(entry)
+        _emit_partial(entry)
+
     # Redirect stdout to suppress stray compiler messages during collection
     real_stdout = sys.stdout
     sys.stdout = open(os.devnull, "w")
@@ -229,7 +277,7 @@ def run(
                 # OOM at large volumes (e.g. 32^4 on a small host) is
                 # expected; record and continue rather than aborting.
                 for B in batch_sizes:
-                    results.append({
+                    _record({
                         "label": label, "B": B,
                         "cpu": float("nan"),
                         "skipped": f"alloc failed: {type(e).__name__}",
@@ -260,12 +308,12 @@ def run(
                     "cpu": cpu_aps,
                 }
                 if not use_neuron:
-                    results.append(entry)
+                    _record(entry)
                     continue
 
                 if neuron_error is not None:
                     entry["neuron_error"] = neuron_error
-                    results.append(entry)
+                    _record(entry)
                     continue
 
                 entry["neuron"] = neuron_aps
@@ -274,7 +322,7 @@ def run(
                 # fused kernel — skip them when running an unfused A/B
                 # comparison so the table reflects a single code path.
                 if not fused:
-                    results.append(entry)
+                    _record(entry)
                     continue
 
                 try:
@@ -297,7 +345,7 @@ def run(
                     # per-batch row but flag it.
                     entry["batched_error"] = f"{type(e).__name__}: {e}"
 
-                results.append(entry)
+                _record(entry)
     finally:
         sys.stdout.close()
         sys.stdout = real_stdout

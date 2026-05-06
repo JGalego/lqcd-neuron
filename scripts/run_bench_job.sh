@@ -113,6 +113,17 @@ RUN_ID="${TIMESTAMP}-${INSTANCE_ID}"
 LOG_DIR=$(mktemp -d -t bench-job-XXXX)
 LOG_FILE="${LOG_DIR}/bench.log"
 META_FILE="${LOG_DIR}/meta.txt"
+PARTIAL_DIR="${LOG_DIR}/partial"
+mkdir -p "${PARTIAL_DIR}"
+
+# Live partial-result locations, populated as each lattice finishes.
+PARTIAL_S3_PREFIX="s3://${S3_BUCKET}/runs/${RUN_ID}/partial/"
+PARTIAL_S3_RESULTS="${PARTIAL_S3_PREFIX}results.jsonl"
+PARTIAL_S3_LOG="s3://${S3_BUCKET}/runs/${RUN_ID}/bench.log.partial"
+
+log "Partial results : ${PARTIAL_S3_RESULTS}"
+log "Live log tail   : ${PARTIAL_S3_LOG}"
+log "Tail with: aws s3 cp ${PARTIAL_S3_RESULTS} - | tail -f"
 
 {
     echo "==== lqcd-neuron benchmark run ===="
@@ -144,14 +155,37 @@ META_FILE="${LOG_DIR}/meta.txt"
 # Run the benchmark
 # ---------------------------------------------------------------------------
 log "Running: python examples/bench_dslash.py ${BENCH_ARGS}"
+
+# Periodically push the running log to S3 so the user can follow progress
+# without waiting for the run to finish.  Best-effort; no failure path.
+(
+    while true; do
+        sleep 20
+        [[ -s "${LOG_FILE}" ]] || continue
+        aws s3 cp --region "${AWS_REGION}" --quiet \
+            "${LOG_FILE}" "${PARTIAL_S3_LOG}" 2>/dev/null || true
+    done
+) &
+LOG_TAILER_PID=$!
+# shellcheck disable=SC2064
+trap "kill ${LOG_TAILER_PID} 2>/dev/null || true" EXIT
+
 START_TS=$(date +%s)
 set +e
 # shellcheck disable=SC2086
-python3 examples/bench_dslash.py ${BENCH_ARGS} 2>&1 | tee "${LOG_FILE}"
+LQCD_BENCH_PARTIAL_DIR="${PARTIAL_DIR}" \
+LQCD_BENCH_PARTIAL_S3="${PARTIAL_S3_PREFIX}" \
+AWS_REGION="${AWS_REGION}" \
+    python3 examples/bench_dslash.py ${BENCH_ARGS} 2>&1 | tee "${LOG_FILE}"
 BENCH_EXIT=${PIPESTATUS[0]}
 set -e
 END_TS=$(date +%s)
 DURATION=$((END_TS - START_TS))
+
+# Stop the live-log uploader; the final upload below supersedes it.
+kill "${LOG_TAILER_PID}" 2>/dev/null || true
+wait "${LOG_TAILER_PID}" 2>/dev/null || true
+trap - EXIT
 
 if [[ "${BENCH_EXIT}" -eq 0 ]]; then
     STATUS="OK"
@@ -197,6 +231,7 @@ SUMMARY_FILE="${LOG_DIR}/summary.txt"
     echo "bench args   : ${BENCH_ARGS}"
     echo "duration     : ${DURATION}s"
     echo "log archive  : ${S3_URI}"
+    echo "partial json : ${PARTIAL_S3_RESULTS}"
     if [[ -n "${PRESIGNED_URL}" ]]; then
         echo
         echo "Download (valid 7 days):"

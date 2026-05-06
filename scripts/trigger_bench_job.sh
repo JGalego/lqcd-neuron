@@ -177,6 +177,8 @@ print(json.dumps({"commands": [cmd], "executionTimeout": ["7200"]}))
         --output text)
     log "Command ID  : ${CMD_ID}"
     log "An email will be sent to the SNS-subscribed address when the run finishes."
+    log "Attach a shell with:"
+    log "  aws ssm start-session --region ${AWS_REGION} --target ${INSTANCE_ID}"
 
     if [[ "${WAIT}" -eq 1 ]]; then
         log "Waiting for completion (this can take a while) …"
@@ -316,3 +318,5 @@ aws ec2 create-tags \
 log "The instance will email results, then self-terminate."
 log "Watch progress with:"
 log "  aws ec2 describe-instance-status --region ${AWS_REGION} --instance-ids ${EPHEMERAL_ID}"
+log "Attach a shell with:"
+log "  aws ssm start-session --region ${AWS_REGION} --target ${EPHEMERAL_ID}"
