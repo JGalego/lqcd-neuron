@@ -201,6 +201,7 @@ connect-bench:  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTI
 #   make bench-job NEURON=1 LATTICE="16x16x16x16 24x24x24x24"
 #   make bench-job MODE=ephemeral NO_FUSED=1
 #   make bench-job MODE=ephemeral WALLCLOCK=480
+#   make bench-job MODE=ephemeral OPTLEVEL=1
 # ---------------------------------------------------------------------------
 
 MODE   ?= ephemeral
@@ -212,6 +213,7 @@ _JOB_FLAGS  = $(if $(filter 1,$(NEURON)),--neuron)
 _JOB_FLAGS += $(if $(filter 1,$(NO_FUSED)),--no-fused)
 _JOB_FLAGS += $(foreach l,$(LATTICE),--lattice $(l))
 _JOB_FLAGS += $(if $(BATCH),--batch-sizes $(BATCH))
+_JOB_FLAGS += $(if $(OPTLEVEL),--optlevel $(OPTLEVEL))
 
 .PHONY: bench-job
 bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral] [WAIT=1] [WALLCLOCK=min]

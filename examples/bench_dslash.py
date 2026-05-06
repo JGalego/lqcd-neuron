@@ -229,6 +229,7 @@ def run(
     fused: bool = True,
     lattices: Optional[List[Tuple[int, int, int, int]]] = None,
     batch_sizes: Optional[List[int]] = None,
+    optlevel: int = 2,
 ) -> None:
     dtype = torch.complex64
     nc    = 3
@@ -250,7 +251,10 @@ def run(
     logging.getLogger("lqcd_neuron.neuron.compiler").setLevel(logging.INFO)
     logging.getLogger("torch_neuronx").setLevel(logging.INFO)
 
-    compiler = NeuronCompiler(dtype="bfloat16") if use_neuron else None
+    compiler = (
+        NeuronCompiler(dtype="bfloat16", optimize_level=optlevel)
+        if use_neuron else None
+    )
     num_cores = get_device().num_cores if use_neuron else 1
     show_multicore = use_neuron and num_cores > 1
     multi_batch = len(batch_sizes) > 1
@@ -474,6 +478,17 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--optlevel",
+        type=int,
+        choices=[1, 2, 3],
+        default=2,
+        help=(
+            "neuronx-cc optimisation level (1=fast compile, 3=max perf). "
+            "Forwarded to NeuronCompiler(optimize_level=...) which sets "
+            "NEURON_CC_FLAGS=--optlevel <N>.  Default: 2."
+        ),
+    )
+    parser.add_argument(
         "--batch-sizes",
         type=_parse_batch_sizes,
         default=None,
@@ -493,4 +508,5 @@ if __name__ == "__main__":
         fused=not args.no_fused,
         lattices=args.lattices,
         batch_sizes=args.batch_sizes,
+        optlevel=args.optlevel,
     )
