@@ -273,6 +273,10 @@ make bench-job ──► │ scripts/trigger_bench_job.sh    │ (local)
                    │ • git pull + DLAMI venv         │
                    │ • collect neuron-ls / git SHA   │
                    │ • python examples/bench_dslash  │
+                   │   → stream per-lattice JSONL    │
+                   │     to runs/<id>/partial/...    │
+                   │ • 20s tail of bench.log to      │
+                   │     runs/<id>/bench.log.partial │
                    │ • upload full log to S3         │
                    │ • presign 7-day download URL    │
                    │ • SNS publish summary           │

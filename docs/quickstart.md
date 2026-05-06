@@ -283,6 +283,15 @@ section of the top-level README for the full setup (notably:
 `notification_email` in `terraform.tfvars` plus a one-click confirmation of
 the SNS subscription).
 
+While the run is in flight, partial results land in S3 as soon as each
+lattice finishes — no need to wait for the full sweep:
+
+```bash
+make bench-runs                       # list runs uploaded so far
+make bench-tail RUN=<run_id> | jq .   # stream per-lattice JSONL
+make bench-tail RUN=<run_id> LOG=1    # follow the live bench.log
+```
+
 ### Choosing batch sizes
 
 | Regime | Lattice | Suggested `BATCH` |

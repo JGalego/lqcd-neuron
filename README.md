@@ -230,6 +230,19 @@ make bench-job NEURON=1 BATCH=1,8,32,64           # sweep batch sizes
 make bench-job MODE=persistent WAIT=1             # block until the SSM command finishes
 ```
 
+Partial results stream to S3 as each `(lattice, batch_size)` finishes, so
+you don't have to wait for the full sweep to land in your inbox.  The
+on-instance script writes a JSONL feed to
+`s3://<bench-bucket>/runs/<run_id>/partial/results.jsonl` (one entry per
+lattice/batch) and re-uploads `bench.log` every 20 s to
+`s3://<bench-bucket>/runs/<run_id>/bench.log.partial`.  Two helpers:
+
+```bash
+make bench-runs                            # list runs in the bucket
+make bench-tail RUN=<run_id>               # stream the partial JSONL
+make bench-tail RUN=<run_id> LOG=1         # follow the live bench.log
+```
+
 ### Profiling & monitoring
 
 Use the Neuron SDK's built-in tools directly:
