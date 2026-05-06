@@ -221,7 +221,8 @@ bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral]
 # ---------------------------------------------------------------------------
 # Inspect partial results streamed by an in-flight bench-job to S3.
 #   make bench-runs                       # list runs in the bucket
-#   make bench-tail RUN=<run_id>          # tail per-lattice JSONL
+#   make bench-tail RUN=<run_id>          # per-lattice results as a table
+#   make bench-tail RUN=<run_id> RAW=1    # raw JSONL (one line per entry)
 #   make bench-tail RUN=<run_id> LOG=1    # tail the running bench.log
 # ---------------------------------------------------------------------------
 _BENCH_BUCKET = $$(tofu -chdir=$(INFRA_DIR) output -raw bench_s3_bucket)
@@ -231,15 +232,83 @@ _BENCH_REGION = $$(tofu -chdir=$(INFRA_DIR) output -raw aws_region)
 bench-runs:  ## List bench runs uploaded to the S3 bucket
 	aws s3 ls --region $(_BENCH_REGION) "s3://$(_BENCH_BUCKET)/runs/"
 
+define _BENCH_TAIL_PY
+import json, os, sys
+
+rows = [json.loads(l) for l in sys.stdin if l.strip()]
+if not rows:
+    print("(no partial results yet)"); sys.exit(0)
+
+# ANSI bold green for the winning throughput column; disabled when not a
+# TTY or when NO_COLOR is set (https://no-color.org/).
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+BOLD = "\033[1;32m" if USE_COLOR else ""
+RESET = "\033[0m"  if USE_COLOR else ""
+
+THROUGHPUT_KEYS = ("cpu", "neuron", "batched", "multicore")
+
+def _num(r, k):
+    v = r.get(k)
+    return v if isinstance(v, (int, float)) else None
+
+def _fmt(v):
+    return f"{v:.1f}" if isinstance(v, (int, float)) else ""
+
+def _speedup(r):
+    cpu = _num(r, "cpu")
+    if not cpu:
+        return ""
+    best = max((v for v in (_num(r, k) for k in THROUGHPUT_KEYS[1:]) if v is not None), default=None)
+    if best is None:
+        return ""
+    return f"{best / cpu:.1f}x"
+
+cols = [
+    ("t_utc",     "time (UTC)", lambda r: r.get("t_utc", "")),
+    ("label",     "Lattice",    lambda r: r.get("label", "")),
+    ("B",         "B",          lambda r: str(r.get("B", ""))),
+    ("cpu",       "CPU",        lambda r: _fmt(_num(r, "cpu"))),
+    ("neuron",    "Neuron",     lambda r: _fmt(_num(r, "neuron"))),
+    ("batched",   "Batched",    lambda r: _fmt(_num(r, "batched"))),
+    ("multicore", "Multicore",  lambda r: _fmt(_num(r, "multicore"))),
+    ("speedup",   "Speedup",    _speedup),
+    ("note",      "note",       lambda r: r.get("skipped") or r.get("neuron_error") or r.get("batched_error") or ""),
+]
+data = [[fn(r) for _, _, fn in cols] for r in rows]
+widths = [max(len(h), *(len(row[i]) for row in data)) for i, (_, h, _) in enumerate(cols)]
+key_to_idx = {k: i for i, (k, _, _) in enumerate(cols)}
+
+# Pad first (so column widths line up), then wrap the winning cell in
+# ANSI codes -- doing it this order keeps alignment correct since the
+# escape sequences have zero printed width.
+header = "  ".join(h.ljust(w) for (_, h, _), w in zip(cols, widths))
+print(header)
+print("  ".join("-" * w for w in widths))
+for row, raw in zip(data, rows):
+    cells = [val.ljust(w) for val, w in zip(row, widths)]
+    nums = [(k, _num(raw, k)) for k in THROUGHPUT_KEYS]
+    nums = [(k, v) for k, v in nums if v is not None]
+    if nums:
+        winner = max(nums, key=lambda kv: kv[1])[0]
+        i = key_to_idx[winner]
+        cells[i] = f"{BOLD}{cells[i]}{RESET}"
+    print("  ".join(cells))
+endef
+export _BENCH_TAIL_PY
+
 .PHONY: bench-tail
-bench-tail:  ## Tail partial results of an in-flight run [RUN=<id>] [LOG=1]
-	@if [ -z "$(RUN)" ]; then echo "Usage: make bench-tail RUN=<run_id> [LOG=1]"; exit 2; fi
+bench-tail:  ## Tail partial results of an in-flight run [RUN=<id>] [RAW=1] [LOG=1]
+	@if [ -z "$(RUN)" ]; then echo "Usage: make bench-tail RUN=<run_id> [RAW=1] [LOG=1]"; exit 2; fi
 	@if [ "$(LOG)" = "1" ]; then \
 	    aws s3 cp --region $(_BENCH_REGION) \
 	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/bench.log.partial" -; \
-	else \
+	elif [ "$(RAW)" = "1" ]; then \
 	    aws s3 cp --region $(_BENCH_REGION) \
 	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/partial/results.jsonl" -; \
+	else \
+	    aws s3 cp --region $(_BENCH_REGION) \
+	        "s3://$(_BENCH_BUCKET)/runs/$(RUN)/partial/results.jsonl" - \
+	    | python3 -c "$$_BENCH_TAIL_PY"; \
 	fi
 
 .PHONY: tfvars
