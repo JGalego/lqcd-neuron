@@ -462,6 +462,10 @@ cols = [
     ("note",      "note",       lambda r: r.get("skipped") or r.get("neuron_error") or r.get("batched_error") or ""),
 ]
 data = [[fn(r) for _, _, fn in cols] for r in rows]
+# Drop columns that are empty for every row (e.g. t_utc in averaged mode).
+keep = [i for i in range(len(cols)) if any(row[i] for row in data)]
+cols = [cols[i] for i in keep]
+data = [[row[i] for i in keep] for row in data]
 widths = [max(len(h), *(len(row[i]) for row in data)) for i, (_, h, _) in enumerate(cols)]
 key_to_idx = {k: i for i, (k, _, _) in enumerate(cols)}
 
@@ -477,8 +481,9 @@ for row, raw in zip(data, rows):
     nums = [(k, v) for k, v in nums if v is not None]
     if nums:
         winner = max(nums, key=lambda kv: kv[1])[0]
-        i = key_to_idx[winner]
-        cells[i] = f"{BOLD}{cells[i]}{RESET}"
+        if winner in key_to_idx:
+            i = key_to_idx[winner]
+            cells[i] = f"{BOLD}{cells[i]}{RESET}"
     print("  ".join(cells))
 endef
 export _BENCH_TAIL_PY
@@ -500,16 +505,20 @@ for line in sys.stdin:
         r = json.loads(line)
     except json.JSONDecodeError:
         continue
-    if "run_id" in r:
-        runs.add(r["run_id"])
+    run_id = r.get("_run") or r.get("run_id") or ""
+    if run_id:
+        runs.add(run_id)
     key = (r.get("label", ""), r.get("B", ""))
     g = groups.setdefault(key, {
         "label": key[0], "B": key[1],
         "_sum": collections.defaultdict(float),
         "_n":   collections.defaultdict(int),
+        "_runs": set(),
         "_count": 0,
     })
     g["_count"] += 1
+    if run_id:
+        g["_runs"].add(run_id)
     for k in THROUGHPUT_KEYS:
         v = r.get(k)
         if isinstance(v, (int, float)):
@@ -527,11 +536,11 @@ print(f"# averaged across {len(runs) or '?'} run(s), {sum(g['_count'] for g in g
 
 for key in sorted(groups, key=lambda k: (_vol(k[0]), k[1] if isinstance(k[1], int) else 0)):
     g = groups[key]
-    out = {"t_utc": "", "label": g["label"], "B": g["B"]}
+    out = {"label": g["label"], "B": g["B"]}
     for k in THROUGHPUT_KEYS:
         if g["_n"][k]:
             out[k] = g["_sum"][k] / g["_n"][k]
-    out["note"] = f"avg(n={g['_count']})"
+    out["note"] = ", ".join(sorted(g["_runs"])) if g["_runs"] else f"avg(n={g['_count']})"
     print(json.dumps(out))
 endef
 export _BENCH_AVG_PY
@@ -562,7 +571,9 @@ bench-tail:  ## Tail partial results [no RUN: avg across all runs] [RUN=<id>] [R
 	    for r in $$runs; do \
 	        aws s3 cp --region $(_BENCH_REGION) \
 	            "s3://$(_BENCH_BUCKET)/runs/$$r/partial/results.jsonl" - \
-	            2>/dev/null >> $$tmp || true; \
+	            2>/dev/null \
+	            | awk -v r="$$r" 'NF { sub(/^{/, "{\"_run\":\"" r "\","); print }' \
+	            >> $$tmp || true; \
 	    done; \
 	    if [ ! -s $$tmp ]; then \
 	        echo "(no partial results found across $$(echo $$runs | wc -w) run(s))"; \
@@ -574,6 +585,24 @@ bench-tail:  ## Tail partial results [no RUN: avg across all runs] [RUN=<id>] [R
 	        python3 -c "$$_BENCH_AVG_PY" < $$tmp | python3 -c "$$_BENCH_TAIL_PY"; \
 	    fi; \
 	fi
+
+.PHONY: bench-rm
+bench-rm:  ## Delete a bench run from S3 (RUN=<id> [YES=1] to skip prompt)
+	@if [ -z "$(RUN)" ]; then \
+	    echo "Usage: make bench-rm RUN=<run_id> [YES=1]"; exit 2; \
+	fi
+	@prefix="s3://$(_BENCH_BUCKET)/runs/$(RUN)/"; \
+	count=$$(aws s3 ls --region $(_BENCH_REGION) --recursive "$$prefix" \
+	    2>/dev/null | wc -l); \
+	if [ "$$count" -eq 0 ]; then \
+	    echo "(no objects under $$prefix)"; exit 0; \
+	fi; \
+	echo "About to delete $$count object(s) under $$prefix"; \
+	if [ "$(YES)" != "1" ]; then \
+	    printf "Continue? [y/N] "; read ans; \
+	    case "$$ans" in y|Y|yes|YES) ;; *) echo "aborted."; exit 1 ;; esac; \
+	fi; \
+	aws s3 rm --region $(_BENCH_REGION) --recursive "$$prefix"
 
 .PHONY: tfvars
 tvars:  ## Copy the example tfvars file (edit before running tofu-apply)
