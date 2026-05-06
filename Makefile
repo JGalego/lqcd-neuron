@@ -230,7 +230,16 @@ _BENCH_REGION = $$(tofu -chdir=$(INFRA_DIR) output -raw aws_region)
 
 .PHONY: bench-runs
 bench-runs:  ## List bench runs uploaded to the S3 bucket
-	aws s3 ls --region $(_BENCH_REGION) "s3://$(_BENCH_BUCKET)/runs/"
+	@aws s3 ls --region $(_BENCH_REGION) "s3://$(_BENCH_BUCKET)/runs/" \
+	    | awk '/PRE / {gsub("/","",$$2); print $$2}' \
+	    | sort \
+	    | awk -F- 'BEGIN { printf "%-20s  %s\n%-20s  %s\n", \
+	                       "started (UTC)", "run id", \
+	                       "--------------------", "----------------------------------" } \
+	               { ts=$$1; \
+	                 printf "%s-%s-%s %s:%s:%s  %s\n", \
+	                   substr(ts,1,4), substr(ts,5,2), substr(ts,7,2), \
+	                   substr(ts,10,2), substr(ts,12,2), substr(ts,14,2), $$0 }'
 
 define _BENCH_TAIL_PY
 import json, os, sys
