@@ -220,7 +220,11 @@ Q_BRANCH=$(printf    '%q' "${BRANCH}")
 SCRIPT_PATH="${REPO_ROOT}/scripts/run_bench_job.sh"
 [[ -f "${SCRIPT_PATH}" ]] || {
     echo "ERROR: ${SCRIPT_PATH} missing" >&2; exit 1; }
-RUN_BENCH_JOB_SH=$(cat "${SCRIPT_PATH}")
+# NOTE: we deliberately do NOT inline run_bench_job.sh into user-data --
+# EC2 user-data is capped at 16 KiB and the bench script is now ~10 KiB.
+# The git pre-flight at the top of this file guarantees the requested
+# branch is clean and pushed, so the clone below always has the same
+# scripts/run_bench_job.sh that the local trigger just validated.
 
 USER_DATA=$(cat <<EOF
 #!/bin/bash
@@ -255,16 +259,10 @@ set -uo pipefail
 REPO_URL=${Q_REPO_URL}
 BRANCH=${Q_BRANCH}
 
-# Drop the embedded run_bench_job.sh in /tmp so it runs even if the
-# orchestration changes haven't been pushed to the remote branch yet.
-cat > /tmp/run_bench_job.sh <<'BENCH_EOF'
-${RUN_BENCH_JOB_SH}
-BENCH_EOF
-chmod +x /tmp/run_bench_job.sh
-chown ubuntu:ubuntu /tmp/run_bench_job.sh
-
 # Run the bench as the ubuntu user.  We clone the repo fresh so the
-# instance picks up whatever branch was requested at trigger time.
+# instance picks up whatever branch was requested at trigger time, and
+# run scripts/run_bench_job.sh straight out of the checkout (the local
+# git pre-flight guarantees the script is up to date on origin).
 sudo -u ubuntu -H \\
     BENCH_ARGS=${Q_BENCH_ARGS} \\
     SNS_TOPIC_ARN=${Q_SNS_ARN} \\
@@ -284,7 +282,7 @@ sudo -u ubuntu -H \\
         git checkout --quiet "\$GIT_BRANCH"
         git reset --hard "origin/\$GIT_BRANCH"
         export REPO_DIR="\$HOME/lqcd-neuron"
-        bash /tmp/run_bench_job.sh
+        bash scripts/run_bench_job.sh
     '
 BENCH_RC=\$?
 # run_bench_job.sh handles its own SNS publish on success or bench failure;
@@ -299,6 +297,17 @@ EOF
 # AWS expects user-data as base64 when passed via --user-data with the
 # CLI (it's actually the raw text, but base64 sidesteps shell quoting).
 USER_DATA_B64=$(printf '%s' "${USER_DATA}" | base64 -w0)
+
+# EC2 caps user-data at 16 KiB of *raw* (pre-base64) bytes. Bail out with
+# a clear message rather than relying on the opaque RunInstances error.
+USER_DATA_BYTES=$(printf '%s' "${USER_DATA}" | wc -c)
+if [[ "${USER_DATA_BYTES}" -gt 16384 ]]; then
+    echo "ERROR: user-data is ${USER_DATA_BYTES} bytes (cap: 16384)." >&2
+    echo "       Trim trigger_bench_job.sh or move logic into" >&2
+    echo "       scripts/run_bench_job.sh which is fetched via git on boot." >&2
+    exit 1
+fi
+log "User-data    : ${USER_DATA_BYTES} bytes"
 
 log "Launching one-shot Inf2 from launch template ${LAUNCH_TEMPLATE_ID} …"
 INSTANCE_JSON=$(aws ec2 run-instances \
