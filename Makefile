@@ -235,18 +235,189 @@ bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral]
 _BENCH_BUCKET = $$(tofu -chdir=$(INFRA_DIR) output -raw bench_s3_bucket)
 _BENCH_REGION = $$(tofu -chdir=$(INFRA_DIR) output -raw aws_region)
 
+# Classify a run from its S3 artefacts (and a single EC2 cross-check):
+#   DONE OK / DONE FAILED / DONE ?  -- final bench.log present
+#   RUNNING                          -- partial/* present, instance alive,
+#                                       last partial < STALE_MIN ago
+#   STALE                            -- partial/* present, last update >
+#                                       STALE_MIN ago, instance still alive
+#   ABANDONED                        -- partial/* present but the launching
+#                                       EC2 instance is gone (terminated or
+#                                       never existed in this account)
+#   UNKNOWN                          -- prefix exists with no usable artefacts
+# Tunable: STALE_MIN env var (default 30 minutes).
+define _BENCH_RUNS_PY
+import datetime as dt
+import json, os, subprocess, sys, collections
+
+REGION = os.environ["_BENCH_REGION"]
+BUCKET = os.environ["_BENCH_BUCKET"]
+STALE_MIN = int(os.environ.get("STALE_MIN", "30"))
+
+# ANSI colors; disabled when stdout is not a TTY or NO_COLOR is set.
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def _c(code, s):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+
+def _colorize(status):
+    if status.startswith("DONE OK"):
+        return _c("1;32", status)         # bold green
+    if status.startswith("DONE FAILED"):
+        return _c("1;31", status)         # bold red
+    if status == "RUNNING":
+        return _c("1;33", status)         # bold yellow
+    if status == "STALE":
+        return _c("1;35", status)         # bold magenta
+    if status == "ABANDONED":
+        return _c("1;31", status)         # bold red
+    if status == "UNKNOWN" or status.endswith("?"):
+        return _c("1;90", status)         # bold gray
+    return status
+
+# stdin: JSON array of {Key, LastModified} from list-objects-v2
+try:
+    objects = json.loads(sys.stdin.read() or "[]") or []
+except json.JSONDecodeError:
+    objects = []
+
+def _parse_iso(s):
+    # AWS returns e.g. '2026-05-06T15:42:53+00:00'
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+runs = collections.defaultdict(lambda: {
+    "final": False, "partial": False, "last_partial": None,
+})
+for obj in objects:
+    k = obj.get("Key", "")
+    parts = k.split("/", 2)
+    if len(parts) < 3 or parts[0] != "runs":
+        continue
+    run_id, tail = parts[1], parts[2]
+    info = runs[run_id]
+    if tail == "bench.log":
+        info["final"] = True
+    elif tail.startswith("partial/") or tail.startswith("bench.log.partial"):
+        info["partial"] = True
+        ts = _parse_iso(obj.get("LastModified", ""))
+        if ts and (info["last_partial"] is None or ts > info["last_partial"]):
+            info["last_partial"] = ts
+
+def _final_status(run_id):
+    # One small GET per completed run; the status line is in the meta header.
+    try:
+        out = subprocess.check_output(
+            ["aws", "s3", "cp", "--region", REGION, "--quiet",
+             f"s3://{BUCKET}/runs/{run_id}/bench.log", "-"],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except subprocess.CalledProcessError:
+        return "?"
+    for line in out.splitlines():
+        if line.startswith("status"):
+            _, _, val = line.partition(":")
+            val = val.strip()
+            if val.startswith("OK"):
+                return "OK"
+            if val.startswith("FAILED"):
+                return val.upper()
+            return val.upper() or "?"
+    return "?"
+
+# Cross-check EC2 for the instance ids embedded in still-active run ids.
+# Run id format: <TIMESTAMP>-<INSTANCE_ID>, e.g. 20260506T154253Z-i-0ae62da2330b0aab1
+def _instance_id(run_id):
+    rest = run_id.split("-", 1)[1] if "-" in run_id else ""
+    return rest if rest.startswith("i-") else None
+
+needs_ec2 = {
+    _instance_id(r) for r, info in runs.items()
+    if not info["final"] and _instance_id(r)
+}
+needs_ec2.discard(None)
+
+alive = set()
+if needs_ec2:
+    try:
+        out = subprocess.check_output(
+            ["aws", "ec2", "describe-instances", "--region", REGION,
+             "--instance-ids", *sorted(needs_ec2),
+             "--query", "Reservations[].Instances[].[InstanceId,State.Name]",
+             "--output", "json"],
+            stderr=subprocess.DEVNULL,
+        )
+        for iid, state in json.loads(out or "[]"):
+            # 'terminated' / 'shutting-down' instances still appear here for
+            # ~1h after teardown; treat them as not-alive.
+            if state in ("pending", "running", "stopping", "stopped"):
+                alive.add(iid)
+    except subprocess.CalledProcessError:
+        # If any id has been purged from EC2 entirely, describe-instances
+        # fails the whole call.  Fall back to per-id checks.
+        for iid in sorted(needs_ec2):
+            try:
+                out = subprocess.check_output(
+                    ["aws", "ec2", "describe-instances", "--region", REGION,
+                     "--instance-ids", iid,
+                     "--query", "Reservations[].Instances[].State.Name",
+                     "--output", "text"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                if out in ("pending", "running", "stopping", "stopped"):
+                    alive.add(iid)
+            except subprocess.CalledProcessError:
+                pass
+
+now = dt.datetime.now(dt.timezone.utc)
+stale_delta = dt.timedelta(minutes=STALE_MIN)
+
+rows = []
+for run_id in sorted(runs):
+    info = runs[run_id]
+    if info["final"]:
+        status = "DONE " + _final_status(run_id)
+    elif info["partial"]:
+        iid = _instance_id(run_id)
+        if iid and iid not in alive:
+            status = "ABANDONED"
+        elif info["last_partial"] and (now - info["last_partial"]) > stale_delta:
+            status = "STALE"
+        else:
+            status = "RUNNING"
+    else:
+        status = "UNKNOWN"
+    ts = run_id.split("-", 1)[0]
+    started = (
+        f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+        if len(ts) >= 15 else ts
+    )
+    rows.append((started, run_id, status))
+
+w0 = max([len("started (UTC)")] + [len(r[0]) for r in rows])
+w1 = max([len("run id")]        + [len(r[1]) for r in rows])
+w2 = max([len("status")]        + [len(r[2]) for r in rows])
+print(f"{'started (UTC)'.ljust(w0)}  {'run id'.ljust(w1)}  {'status'.ljust(w2)}")
+print("-" * w0 + "  " + "-" * w1 + "  " + "-" * w2)
+for r in rows:
+    # Pad first (raw width), then colorize -- ANSI codes have zero printed width.
+    status_cell = r[2].ljust(w2)
+    print(f"{r[0].ljust(w0)}  {r[1].ljust(w1)}  {_colorize(status_cell)}")
+endef
+export _BENCH_RUNS_PY
+
 .PHONY: bench-runs
-bench-runs:  ## List bench runs uploaded to the S3 bucket
-	@aws s3 ls --region $(_BENCH_REGION) "s3://$(_BENCH_BUCKET)/runs/" \
-	    | awk '/PRE / {gsub("/","",$$2); print $$2}' \
-	    | sort \
-	    | awk -F- 'BEGIN { printf "%-20s  %s\n%-20s  %s\n", \
-	                       "started (UTC)", "run id", \
-	                       "--------------------", "----------------------------------" } \
-	               { ts=$$1; \
-	                 printf "%s-%s-%s %s:%s:%s  %s\n", \
-	                   substr(ts,1,4), substr(ts,5,2), substr(ts,7,2), \
-	                   substr(ts,10,2), substr(ts,12,2), substr(ts,14,2), $$0 }'
+bench-runs:  ## List bench runs in S3 [STALE_MIN=30]
+	@_BENCH_REGION=$(_BENCH_REGION) _BENCH_BUCKET=$(_BENCH_BUCKET) \
+	 STALE_MIN=$(or $(STALE_MIN),30) \
+	 aws s3api list-objects-v2 --region $(_BENCH_REGION) \
+	    --bucket $(_BENCH_BUCKET) --prefix runs/ \
+	    --query 'Contents[].{Key:Key,LastModified:LastModified}' \
+	    --output json 2>/dev/null \
+	    | _BENCH_REGION=$(_BENCH_REGION) _BENCH_BUCKET=$(_BENCH_BUCKET) \
+	      STALE_MIN=$(or $(STALE_MIN),30) \
+	      python3 -c "$$_BENCH_RUNS_PY"
 
 define _BENCH_TAIL_PY
 import json, os, sys
