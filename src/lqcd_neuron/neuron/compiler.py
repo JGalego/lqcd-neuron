@@ -850,6 +850,20 @@ class NeuronCompiler:
                         ``'bfloat16'``).  Trn1/Inf2 prefer bfloat16.
         optimize_level: Compiler optimisation level (1–3).
         device:         Override the detected :class:`NeuronDevice`.
+        sram_threshold_bytes:
+                        Override the byte budget compared against the fused
+                        kernel size to decide whether to auto-fall back to the
+                        unfused baked-gauge path.  Defaults to
+                        ``0.60 * 24 MiB`` on NeuronCore-v2.  Pass a very large
+                        value (e.g. ``10**12``) to defer the check
+                        indefinitely.
+        allow_fused_fallback:
+                        When ``True`` (default) ``compile_dslash(..., fused=True)``
+                        silently downgrades to the unfused path if the fused
+                        kernels exceed ``sram_threshold_bytes``.  When ``False``
+                        that downgrade becomes a :class:`RuntimeError`, useful
+                        when running A/B benchmarks that must isolate the
+                        fused kernel.
     """
 
     def __init__(
@@ -859,6 +873,7 @@ class NeuronCompiler:
         optimize_level: int = 2,
         device: Optional[NeuronDevice] = None,
         sram_threshold_bytes: Optional[int] = None,
+        allow_fused_fallback: bool = True,
     ) -> None:
         self.dtype = dtype
         self.optimize_level = optimize_level
@@ -867,6 +882,11 @@ class NeuronCompiler:
         # Override the auto-detected SRAM budget for the fused-kernel fallback.
         # None means use the default fraction of _NC2_SRAM_BYTES.
         self.sram_threshold_bytes = sram_threshold_bytes
+        # When False, raising the budget no longer matters: any attempt to
+        # silently downgrade fused -> unfused becomes a hard RuntimeError so
+        # users measuring fused-only throughput aren't surprised by a
+        # backend swap they didn't request.
+        self.allow_fused_fallback = allow_fused_fallback
 
         if workdir is None:
             workdir = str(Path.home() / ".cache" / "lqcd-neuron" / "neuronx")
@@ -1061,12 +1081,24 @@ class NeuronCompiler:
                 )
                 kb = _fused_kernel_bytes(lattice_shape, ns=ns, nc=nc, dtype=dt)
                 if kb > sram_budget:
+                    if not self.allow_fused_fallback:
+                        raise RuntimeError(
+                            f"compile_dslash: fused kernels "
+                            f"({kb / 1024**2:.1f} MiB) exceed SRAM budget "
+                            f"({sram_budget / 1024**2:.1f} MiB) for lattice "
+                            f"{lattice_shape}, and "
+                            "NeuronCompiler(allow_fused_fallback=False) was "
+                            "set.  Either raise sram_threshold_bytes (e.g. "
+                            "10**12 to disable the check), pass fused=False "
+                            "explicitly, or re-enable allow_fused_fallback."
+                        )
                     logger.warning(
                         "compile_dslash: fused kernels (%.1f MiB) exceed SRAM "
                         "budget (%.1f MiB) for lattice %s — auto-falling back "
                         "to unfused baked-gauge path. "
-                        "Override with NeuronCompiler(sram_threshold_bytes=N) "
-                        "or pass fused=False explicitly.",
+                        "Override with NeuronCompiler(sram_threshold_bytes=N), "
+                        "pass fused=False explicitly, or set "
+                        "allow_fused_fallback=False to raise instead.",
                         kb / 1024**2,
                         sram_budget / 1024**2,
                         lattice_shape,

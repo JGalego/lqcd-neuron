@@ -85,6 +85,7 @@ smoke-neuron:  ## Run all examples with Neuron compilation (requires Inf2/Trn1)
 #   NO_FUSED=1            disable fused (Ns*Nc)^2 kernels — A/B diagnostic
 #   LATTICE=TxZxYxX       benchmark only this lattice size
 #   LATTICE="A B C"       benchmark multiple specific sizes (space-separated)
+#   BATCH=B1,B2,...       sweep multi-RHS batch sizes (default: 1,8,32)
 #
 # Examples:
 #   make bench
@@ -92,19 +93,22 @@ smoke-neuron:  ## Run all examples with Neuron compilation (requires Inf2/Trn1)
 #   make bench NEURON=1 NO_FUSED=1
 #   make bench NEURON=1 LATTICE=16x8x8x8
 #   make bench NEURON=1 LATTICE="8x8x8x4 16x16x16x16" NO_FUSED=1
+#   make bench NEURON=1 BATCH=1,8,32,64
 # ---------------------------------------------------------------------------
 
 NEURON   ?= 0
 NO_FUSED ?= 0
 LATTICE  ?=
+BATCH    ?=
 
 _BENCH_FLAGS  = $(if $(filter 1,$(NEURON)),--neuron)
 _BENCH_FLAGS += $(if $(filter 1,$(NO_FUSED)),--no-fused)
 _BENCH_FLAGS += $(foreach l,$(LATTICE),--lattice $(l))
+_BENCH_FLAGS += $(if $(BATCH),--batch-sizes $(BATCH))
 
 .PHONY: bench
-bench:  ## Dslash throughput benchmark [NEURON=1] [NO_FUSED=1] [LATTICE="TxZxYxX ..."]
-	@echo "Bench config: NEURON=$(NEURON)  NO_FUSED=$(NO_FUSED)  LATTICE=$(if $(LATTICE),$(LATTICE),(all))"
+bench:  ## Dslash throughput benchmark [NEURON=1] [NO_FUSED=1] [LATTICE=...] [BATCH=1,8,32]
+	@echo "Bench config: NEURON=$(NEURON)  NO_FUSED=$(NO_FUSED)  LATTICE=$(if $(LATTICE),$(LATTICE),(all))  BATCH=$(if $(BATCH),$(BATCH),(default))"
 	@echo "Flags:        $(_BENCH_FLAGS)"
 	@echo ""
 	. $(VENV_ACTIVATE) && $(PYTHON) examples/bench_dslash.py $(_BENCH_FLAGS)
@@ -174,9 +178,9 @@ connect-test:  ## Run tests on the instance
 	bash scripts/connect_inf2.sh --test
 
 .PHONY: connect-bench
-connect-bench:  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTICE="TxZxYxX ..."]
+connect-bench:  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTICE=...] [BATCH=...]
 	chmod +x scripts/connect_inf2.sh
-	bash scripts/connect_inf2.sh --bench $(if $(filter 1,$(NEURON)),--neuron) $(if $(filter 1,$(NO_FUSED)),--no-fused) $(foreach l,$(LATTICE),--lattice $(l))
+	bash scripts/connect_inf2.sh --bench $(if $(filter 1,$(NEURON)),--neuron) $(if $(filter 1,$(NO_FUSED)),--no-fused) $(foreach l,$(LATTICE),--lattice $(l)) $(if $(BATCH),--batch-sizes $(BATCH))
 
 # ---------------------------------------------------------------------------
 # Benchmark job (fire-and-forget, results emailed via SNS)
@@ -204,6 +208,7 @@ NEURON ?= 1
 _JOB_FLAGS  = $(if $(filter 1,$(NEURON)),--neuron)
 _JOB_FLAGS += $(if $(filter 1,$(NO_FUSED)),--no-fused)
 _JOB_FLAGS += $(foreach l,$(LATTICE),--lattice $(l))
+_JOB_FLAGS += $(if $(BATCH),--batch-sizes $(BATCH))
 
 .PHONY: bench-job
 bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral] [WAIT=1]

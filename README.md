@@ -157,9 +157,15 @@ Speedup = best Neuron / CPU.
 | 16×8×8×8     |  229.2 |    37.2 |    253.8 |      220.1 |   1.0× †|    2.38 |  0.17 |
 | 16×16×16×16  |   59.6 |     1.2 |     24.4 |       15.8 |   0.3× †|    1.36 |  0.10 |
 
-> **†** Fused kernels exceed NeuronCore SRAM budget (14.4 MiB) at this volume;
-> the compiler automatically falls back to the unfused baked-gauge path.
-> Override with `NeuronCompiler(sram_threshold_bytes=N)` or `fused=False`.
+> **†** Fused kernels exceed the SRAM budget at this volume (default ~14.4 MiB
+> on NeuronCore-v2, i.e. 60% of the 24 MiB SBUF); the compiler automatically
+> falls back to the unfused baked-gauge path, which keeps gauge baking but
+> drops the per-site 12×12 fusion in favour of the original 3×3 colour + 4×4
+> spin einsums (≈12× smaller working set).  Override the trip point with
+> `NeuronCompiler(sram_threshold_bytes=N)`, force the path with `fused=False`
+> (or `make bench NEURON=1 NO_FUSED=1`), or hard-disable the silent
+> downgrade with `NeuronCompiler(allow_fused_fallback=False)` to make any
+> spill a `RuntimeError` instead.
 
 > **Legend** — all throughputs in Dslash applications/sec (higher is better):
 > - **CPU** — CPU baseline, single RHS (FP32)
@@ -193,9 +199,14 @@ Three compile-time optimisations make this possible:
 Reproduce locally with:
 
 ```bash
-make bench NEURON=1                # Neuron vs CPU Dslash benchmark
-make connect-bench NEURON=1        # SSH into the instance and run the benchmark
+make bench NEURON=1                       # default sweep (B = 8, 16, 32)
+make bench NEURON=1 BATCH=1,8,32,64       # custom batch-size sweep
+make bench NEURON=1 LATTICE=16x16x16x16   # restrict to one lattice
+make connect-bench NEURON=1               # SSH into the instance and run there
 ```
+
+The `--batch-sizes` flag emits one row per `(lattice, B)` so you can see where
+dispatch overhead stops dominating and HBM bandwidth takes over.
 
 ### Fire-and-forget bench job (results emailed)
 
@@ -215,6 +226,7 @@ interactive SSH/SSM work; `MODE=persistent` then becomes available.
 make bench-job                                    # ephemeral one-shot Inf2 (default)
 make bench-job MODE=persistent                    # SSM RunCommand on the long-running instance
 make bench-job NEURON=1 LATTICE="16x16x16x16"     # restrict to one lattice
+make bench-job NEURON=1 BATCH=1,8,32,64           # sweep batch sizes
 make bench-job MODE=persistent WAIT=1             # block until the SSM command finishes
 ```
 

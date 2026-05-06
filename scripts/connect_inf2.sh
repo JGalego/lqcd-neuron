@@ -47,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --neuron)    BENCH_FLAGS="${BENCH_FLAGS} --neuron";   shift ;;
         --no-fused)  BENCH_FLAGS="${BENCH_FLAGS} --no-fused"; shift ;;
         --lattice)   BENCH_FLAGS="${BENCH_FLAGS} --lattice $2"; shift 2 ;;
+        --batch-sizes) BENCH_FLAGS="${BENCH_FLAGS} --batch-sizes $2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done

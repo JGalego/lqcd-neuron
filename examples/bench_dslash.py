@@ -10,6 +10,9 @@ Run on CPU:
 Run on Trn1 / Inf2 (torch-neuronx must be installed):
     python examples/bench_dslash.py --neuron
 
+Sweep multi-RHS batch sizes (default: 8,16,32):
+    python examples/bench_dslash.py --neuron --batch-sizes 1,8,32,64
+
 Output (example on Inf2):
     Lattice 4x4x4x4  | CPU   :   142 apps/s
     Lattice 4x4x4x4  | Neuron:  2840 apps/s  (×20)
@@ -63,7 +66,20 @@ BYTES_PER_SITE_BF16 = 96
 
 WARMUP_ITERS = 5
 BENCH_ITERS  = 50
-BATCH_SIZE   = 8   # multi-RHS batch size for the batched Neuron column
+
+# Default multi-RHS batch sizes for the Batched / Multicore columns.
+#
+#   B=8   amortises per-call dispatch overhead on small/mid lattices
+#   B=16  intermediate point on the dispatch → bandwidth transition
+#   B=32  approaches HBM-bandwidth saturation on V >= 16^4 (NeuronCore-v2
+#         BF16 has ~410 GB/s; at V=16^4 a B=32 call streams ~400 MB → ~1 ms,
+#         comparable to the per-call dispatch overhead)
+#
+# All three fit comfortably in NeuronCore-v2's 32 GiB per-chip HBM at every
+# lattice in LATTICE_SIZES.  Note: the Multicore column compiles with
+# per_core_batch_size=B, so its effective per-call RHS count is num_cores*B.
+# Override with --batch-sizes 1,8,32,64.
+DEFAULT_BATCH_SIZES = [8, 16, 32]
 
 
 def benchmark_one(
@@ -141,21 +157,50 @@ def _parse_lattice(s: str) -> Tuple[int, int, int, int]:
         )
 
 
+def _parse_batch_sizes(s: str) -> List[int]:
+    """Parse '1,8,32' into [1, 8, 32]; reject non-positive values."""
+    out: List[int] = []
+    for tok in s.replace(" ", ",").split(","):
+        if not tok:
+            continue
+        try:
+            b = int(tok)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--batch-sizes expects comma-separated ints, got: {s!r}"
+            )
+        if b < 1:
+            raise argparse.ArgumentTypeError(
+                f"--batch-sizes values must be >= 1 (got {b})"
+            )
+        out.append(b)
+    if not out:
+        raise argparse.ArgumentTypeError("--batch-sizes cannot be empty")
+    return out
+
+
 def run(
     use_neuron: bool,
     mass: float = 0.1,
     fused: bool = True,
     lattices: Optional[List[Tuple[int, int, int, int]]] = None,
+    batch_sizes: Optional[List[int]] = None,
 ) -> None:
     dtype = torch.complex64
     nc    = 3
 
     sizes = lattices if lattices else LATTICE_SIZES
+    batch_sizes = batch_sizes if batch_sizes else list(DEFAULT_BATCH_SIZES)
 
     if use_neuron and not is_neuron_available():
         print("WARNING: --neuron requested but no Neuron hardware detected. "
               "Running CPU comparison only.")
         use_neuron = False
+
+    # Batch sweeping only affects the Neuron-side Batched/Multicore columns.
+    # On CPU-only runs collapse to a single row per lattice for readability.
+    if not use_neuron:
+        batch_sizes = batch_sizes[:1]
 
     # Suppress noisy compilation logs — we only want the table
     logging.getLogger("lqcd_neuron.neuron.compiler").setLevel(logging.INFO)
@@ -164,6 +209,7 @@ def run(
     compiler = NeuronCompiler(dtype="bfloat16") if use_neuron else None
     num_cores = get_device().num_cores if use_neuron else 1
     show_multicore = use_neuron and num_cores > 1
+    multi_batch = len(batch_sizes) > 1
 
     # ---- Collect results (compiler may emit messages here) ----
     results: list[dict] = []
@@ -174,74 +220,94 @@ def run(
     try:
         for shape in sizes:
             T, Z, Y, X = shape
-            geom   = LatticeGeometry(T=T, Z=Z, Y=Y, X=X)
+            label = f"{T}x{Z}x{Y}x{X}"
+            geom  = LatticeGeometry(T=T, Z=Z, Y=Y, X=X)
             try:
-                U      = GaugeField.random(geom, seed=0).tensor
-                psi    = ColorSpinorField.gaussian(geom, seed=1).tensor
+                U   = GaugeField.random(geom, seed=0).tensor
+                psi = ColorSpinorField.gaussian(geom, seed=1).tensor
             except (RuntimeError, MemoryError) as e:
                 # OOM at large volumes (e.g. 32^4 on a small host) is
                 # expected; record and continue rather than aborting.
-                results.append({
-                    "label": f"{T}x{Z}x{Y}x{X}",
-                    "cpu": float("nan"),
-                    "skipped": f"alloc failed: {type(e).__name__}",
-                })
+                for B in batch_sizes:
+                    results.append({
+                        "label": label, "B": B,
+                        "cpu": float("nan"),
+                        "skipped": f"alloc failed: {type(e).__name__}",
+                    })
                 continue
-            D      = WilsonDirac(mass=mass, nc=nc, dtype=dtype)
+            D = WilsonDirac(mass=mass, nc=nc, dtype=dtype)
 
+            # CPU and single-RHS Neuron only depend on the lattice, not on
+            # the batch size — measure them once per shape and reuse.
             cpu_aps = benchmark_one(D.forward, psi, U, label="CPU")
-
-            entry: dict = {
-                "label": f"{T}x{Z}x{Y}x{X}",
-                "shape": shape,
-                "cpu": cpu_aps,
-            }
+            neuron_aps = float("nan")
+            neuron_error: Optional[str] = None
 
             if use_neuron:
                 try:
                     D_n = compiler.compile_dslash(
                         D, shape, nc=nc, gauge_field=U, fused=fused,
                     )
-                    entry["neuron"] = benchmark_one(D_n, psi, U, label="Neuron")
+                    neuron_aps = benchmark_one(D_n, psi, U, label="Neuron")
+                except (RuntimeError, MemoryError) as e:
+                    neuron_error = f"{type(e).__name__}: {e}"
 
-                    # The Batched/Multicore paths currently always use the
-                    # fused kernel — skip them when running an unfused A/B
-                    # comparison so the table reflects a single code path.
-                    if not fused:
-                        results.append(entry)
-                        continue
+            for B in batch_sizes:
+                entry: dict = {
+                    "label": label,
+                    "shape": shape,
+                    "B": B,
+                    "cpu": cpu_aps,
+                }
+                if not use_neuron:
+                    results.append(entry)
+                    continue
 
+                if neuron_error is not None:
+                    entry["neuron_error"] = neuron_error
+                    results.append(entry)
+                    continue
+
+                entry["neuron"] = neuron_aps
+
+                # The Batched/Multicore paths currently always use the
+                # fused kernel — skip them when running an unfused A/B
+                # comparison so the table reflects a single code path.
+                if not fused:
+                    results.append(entry)
+                    continue
+
+                try:
                     D_b = compiler.compile_dslash_batched(
-                        D, shape, batch_size=BATCH_SIZE, gauge_field=U, nc=nc
+                        D, shape, batch_size=B, gauge_field=U, nc=nc
                     )
-                    psi_batch = psi.unsqueeze(0).expand(BATCH_SIZE, *psi.shape).contiguous()
+                    psi_batch = psi.unsqueeze(0).expand(B, *psi.shape).contiguous()
                     entry["batched"] = benchmark_batched(D_b, psi_batch)
 
                     if show_multicore:
-                        mc_batch = num_cores * BATCH_SIZE
+                        mc_batch = num_cores * B
                         D_mc = compiler.compile_dslash_multicore(
                             D, shape, gauge_field=U, num_cores=num_cores,
-                            per_core_batch_size=BATCH_SIZE, nc=nc,
+                            per_core_batch_size=B, nc=nc,
                         )
                         psi_mc = psi.unsqueeze(0).expand(mc_batch, *psi.shape).contiguous()
                         entry["multicore"] = benchmark_batched(D_mc, psi_mc)
                 except (RuntimeError, MemoryError) as e:
-                    # Compile/HBM failure at large volumes; report CPU
-                    # number only and continue.
-                    entry["neuron_error"] = f"{type(e).__name__}: {e}"
+                    # Batched/multicore compile or HBM failure — keep the
+                    # per-batch row but flag it.
+                    entry["batched_error"] = f"{type(e).__name__}: {e}"
 
-            results.append(entry)
+                results.append(entry)
     finally:
         sys.stdout.close()
         sys.stdout = real_stdout
 
     # ---- Print table ----
     if use_neuron:
-        cols = [
-            f"{'Lattice':>16}",
-            f"{'CPU':>14}",
-            f"{'Neuron':>14}",
-        ]
+        cols = [f"{'Lattice':>16}"]
+        if multi_batch:
+            cols.append(f"{'B':>4}")
+        cols += [f"{'CPU':>14}", f"{'Neuron':>14}"]
         if fused:
             cols.append(f"{'Batched':>14}")
             if show_multicore:
@@ -250,7 +316,8 @@ def run(
         header = "  ".join(cols)
         ruler  = "-" * len(header)
     else:
-        header = f"{'Lattice':>16}  {'CPU':>14}  {'GFLOP/s':>10}  {'GB/s':>8}"
+        bcol = f"  {'B':>4}" if multi_batch else ""
+        header = f"{'Lattice':>16}{bcol}  {'CPU':>14}  {'GFLOP/s':>10}  {'GB/s':>8}"
         ruler  = "-" * len(header)
 
     # Legend
@@ -260,9 +327,15 @@ def run(
     if use_neuron:
         print(f"    Neuron    = 1 NeuronCore, single RHS")
         if fused:
-            print(f"    Batched   = 1 NeuronCore, {BATCH_SIZE} RHS per call")
-            if show_multicore:
-                print(f"    Multicore = {num_cores} NeuronCores, {BATCH_SIZE} RHS each")
+            if multi_batch:
+                print(f"    Batched   = 1 NeuronCore, B RHS per call")
+                if show_multicore:
+                    print(f"    Multicore = {num_cores} NeuronCores, B RHS each")
+            else:
+                B0 = batch_sizes[0]
+                print(f"    Batched   = 1 NeuronCore, {B0} RHS per call")
+                if show_multicore:
+                    print(f"    Multicore = {num_cores} NeuronCores, {B0} RHS each")
         print(f"    Speedup   = best Neuron / CPU")
         print(f"    GFLOP/s   = derived from best Neuron column "
               f"(1320 flops/site, Babich et al. 2011)")
@@ -275,18 +348,26 @@ def run(
     print(header)
     print(ruler)
 
+    last_label = None
     for entry in results:
+        # Visual separator between lattices when sweeping batch sizes
+        if multi_batch and last_label is not None and entry["label"] != last_label:
+            print()
+        last_label = entry["label"]
+
+        bstr = f"  {entry['B']:>4}" if multi_batch else ""
+
         if "skipped" in entry:
-            print(f"{entry['label']:>16}  [skipped: {entry['skipped']}]",
+            print(f"{entry['label']:>16}{bstr}  [skipped: {entry['skipped']}]",
                   flush=True)
             continue
         if entry.get("neuron_error") and use_neuron:
-            print(f"{entry['label']:>16}  {entry['cpu']:>14.1f}"
+            print(f"{entry['label']:>16}{bstr}  {entry['cpu']:>14.1f}"
                   f"  [neuron failed: {entry['neuron_error']}]",
                   flush=True)
             continue
 
-        line = f"{entry['label']:>16}  {entry['cpu']:>14.1f}"
+        line = f"{entry['label']:>16}{bstr}  {entry['cpu']:>14.1f}"
         shape = entry.get("shape")
         if use_neuron and "neuron" in entry:
             best = entry.get("multicore") or entry.get("batched") or entry["neuron"]
@@ -298,6 +379,8 @@ def run(
                 if show_multicore:
                     line += f"  {entry.get('multicore', float('nan')):>14.1f}"
             line += f"  {speedup:>7.1f}x  {gflops:>10.2f}  {gbps:>8.2f}"
+            if "batched_error" in entry:
+                line += f"  [batched failed: {entry['batched_error']}]"
         elif not use_neuron:
             gflops, gbps = derived_metrics(entry["cpu"], shape, bf16=False)
             line += f"  {gflops:>10.2f}  {gbps:>8.2f}"
@@ -342,10 +425,24 @@ if __name__ == "__main__":
             "Omit to run the full default sweep."
         ),
     )
+    parser.add_argument(
+        "--batch-sizes",
+        type=_parse_batch_sizes,
+        default=None,
+        metavar="B1,B2,...",
+        help=(
+            "Comma-separated multi-RHS batch sizes for the Batched / "
+            "Multicore columns (default: 8,16,32). When more than one value "
+            "is given, the table prints one row per (lattice, batch_size). "
+            "Per-core HBM ceiling on NeuronCore-v2 is ~32 GiB, which fits "
+            "B=64 even at V=24^4 — feel free to push higher."
+        ),
+    )
     args = parser.parse_args()
     run(
         use_neuron=args.neuron,
         mass=args.mass,
         fused=not args.no_fused,
         lattices=args.lattices,
+        batch_sizes=args.batch_sizes,
     )

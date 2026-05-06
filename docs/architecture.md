@@ -249,3 +249,54 @@ float32 round-off (relative error ≲ $10^{-7}$).  The single-RHS path
 also continues to satisfy the existing Dirac unit tests
 (adjoint relation, $\gamma_5$-Hermiticity, normal-operator positivity)
 automatically, since they exercise `WilsonDirac.forward()` directly on CPU.
+
+---
+
+## Bench job infrastructure
+
+For unattended benchmark runs the repo ships an AWS-native fire-and-forget
+pipeline defined in [infra/main.tf](../infra/main.tf):
+
+```
+                   ┌─────────────────────────────────┐
+make bench-job ──► │ scripts/trigger_bench_job.sh    │ (local)
+                   └────────────────┬────────────────┘
+              persistent ─┬─        │        ─┬─ ephemeral (default)
+                          ▼                   ▼
+        aws ssm send-command         aws ec2 run-instances
+        → existing aws_instance.inf2 → one-shot Inf2 from launch template
+                          │                   │
+                          └────────┬──────────┘
+                                   ▼
+                   ┌─────────────────────────────────┐
+                   │ scripts/run_bench_job.sh        │ (on-instance)
+                   │ • git pull + DLAMI venv         │
+                   │ • collect neuron-ls / git SHA   │
+                   │ • python examples/bench_dslash  │
+                   │ • upload full log to S3         │
+                   │ • presign 7-day download URL    │
+                   │ • SNS publish summary           │
+                   │ • shutdown -h  (ephemeral only) │
+                   └────────────────┬────────────────┘
+                                    ▼
+                          email → recipient
+```
+
+The Terraform stack provisions the SNS topic, an encrypted/versioned S3
+bucket with a lifecycle rule, an IAM policy attached to the existing
+instance role granting `sns:Publish` + `s3:PutObject`, and a launch
+template tagged `Lifecycle=ephemeral` with
+`instance_initiated_shutdown_behavior=terminate`.  The on-instance script
+reads the SNS topic ARN and S3 bucket name from instance tags
+(`BenchSnsTopicArn`, `BenchS3Bucket`) via IMDS + `ec2:DescribeTags`, so
+the same script works in both modes without code-change.
+
+Two key Terraform knobs:
+
+- `notification_email` — SNS subscription target.  AWS sends a one-click
+  confirmation link the first time you `tofu apply`.
+- `skip_persistent_instance` — defaults to `true`.  The shared bench
+  infra is provisioned standalone, and `MODE=ephemeral` (the Make default)
+  spins up a fresh Inf2 per run.  Set to `false` to bring the always-on
+  instance back for interactive SSH/SSM work; `MODE=persistent` then
+  becomes available for SSM RunCommand.

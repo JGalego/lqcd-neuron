@@ -235,6 +235,68 @@ All tests run on CPU without Neuron hardware.
 
 ---
 
+## Step 8 — Benchmark Dslash throughput
+
+The shipped [examples/bench_dslash.py](../examples/bench_dslash.py) script
+measures applications-per-second for `WilsonDirac.forward()` across a sweep
+of lattice sizes and multi-RHS batch sizes, with derived GFLOP/s and GB/s
+columns.
+
+### Local quick run
+
+```bash
+make bench                            # CPU baseline only, default lattice sweep
+make bench NEURON=1                   # CPU + Neuron + Batched + Multicore
+make bench NEURON=1 LATTICE=16x8x8x8  # restrict to one lattice
+make bench NEURON=1 BATCH=1,8,32,64   # custom batch-size sweep
+```
+
+The `BATCH` knob (or `--batch-sizes 8,16,32` directly on the script) controls
+the multi-RHS batch sizes used for the `Batched` and `Multicore` columns.
+Default is `8,16,32`, which spans the dispatch-overhead → bandwidth-saturation
+transition for `inf2.*` instances.  Per-core HBM on NeuronCore-v2 is 32 GiB,
+so even `B=64` at `V=24⁴` fits with comfortable headroom — feel free to push
+higher.
+
+Note: the Multicore column compiles with `per_core_batch_size=B`, so its
+effective per-call RHS count is `num_cores * B` (1536 RHS per call at
+`B=64` on `inf2.24xlarge`).  Throughput is reported per-RHS, so columns
+are directly comparable.
+
+The compiled-once-per-(lattice, batch) results are reported as one row per
+combination, with a visual separator between lattices when sweeping multiple
+batches.
+
+### Remote / unattended
+
+```bash
+make connect-bench NEURON=1 BATCH=1,8,32   # SSH to the instance, run there
+make bench-job NEURON=1 BATCH=1,8,32,64    # one-shot Inf2, results emailed
+```
+
+`make bench-job` provisions an ephemeral Inf2 from the bench launch template
+defined in [infra/main.tf](../infra/main.tf), runs the benchmark, archives
+the full log to S3, emails a summary (with a 7-day presigned download URL)
+via SNS, and self-terminates.  See the
+["Fire-and-forget bench job"](../README.md#fire-and-forget-bench-job-results-emailed)
+section of the top-level README for the full setup (notably:
+`notification_email` in `terraform.tfvars` plus a one-click confirmation of
+the SNS subscription).
+
+### Choosing batch sizes
+
+| Regime | Lattice | Suggested `BATCH` |
+|---|---|---|
+| Dispatch-overhead | ≤ 8⁴ | `1,8,32` |
+| Sweet spot | 16⁴ – 24⁴ | `1,8,32,64` |
+| HBM-tight | 32⁴ | `1,4,16` |
+
+The `Speedup` column reports the best Neuron column / CPU; `GFLOP/s` and
+`GB/s` are derived from the Multicore column when available, otherwise
+Batched, otherwise Neuron.
+
+---
+
 ## Profiling & monitoring
 
 The Neuron SDK ships two stock observability tools:
