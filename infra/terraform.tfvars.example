@@ -21,3 +21,19 @@ root_volume_size_gb = 200
 private_key_path    = "~/.ssh/lqcd-neuron.pem"
 key_name            = "lqcd-neuron-key"
 project_tag         = "lqcd-neuron"
+
+# By default the long-running aws_instance.inf2 is NOT created — only the
+# shared bench infra is provisioned and benchmarks run as one-shot Inf2
+# instances via `make bench-job MODE=ephemeral`.
+# Flip to false to bring the always-on instance back (interactive SSH/SSM,
+# `make connect`, `make bench`, etc.).
+# skip_persistent_instance = false
+
+# Email address that will receive benchmark-result notifications.
+# Leave commented to skip the SNS subscription (you can still publish manually).
+# AWS sends a one-click confirmation link; the subscription stays pending
+# until you confirm it.
+# notification_email = "you@example.com"
+
+# Number of days to keep bench logs in S3 before automatic deletion.
+# bench_log_retention_days = 90

@@ -19,13 +19,13 @@ variable "ami_name_filter" {
   description = "Name pattern used to look up the latest Deep Learning AMI for Neuron."
   type        = string
   # Matches: Deep Learning AMI Neuron (Ubuntu 22.04) *
-  default     = "Deep Learning AMI Neuron (Ubuntu 22.04) *"
+  default = "Deep Learning AMI Neuron (Ubuntu 22.04) *"
 }
 
 variable "ami_owner" {
   description = "Owner account ID for the AMI lookup (Amazon = 099720109477 for Ubuntu DLAMIs)."
   type        = string
-  default     = "898082745236"   # Canonical / AWS marketplace owner for Ubuntu DLAMIs
+  default     = "898082745236" # Canonical / AWS marketplace owner for Ubuntu DLAMIs
 }
 
 variable "key_name" {
@@ -43,7 +43,7 @@ variable "private_key_path" {
 variable "allowed_cidr_blocks" {
   description = "CIDR blocks allowed to SSH into the instance. Defaults to your current public IP (0.0.0.0/0 is deliberately not the default)."
   type        = list(string)
-  default     = ["0.0.0.0/0"]   # Override with your actual IP: ["1.2.3.4/32"]
+  default     = ["0.0.0.0/0"] # Override with your actual IP: ["1.2.3.4/32"]
 }
 
 variable "root_volume_size_gb" {
@@ -58,8 +58,59 @@ variable "spot" {
   default     = false
 }
 
+variable "skip_persistent_instance" {
+  description = <<-EOT
+    Skip creating the long-running aws_instance.inf2.  When true (the
+    default) only the shared infra is provisioned: VPC, key pair, IAM
+    role, SNS topic, S3 bucket, and the bench launch template — so
+    benchmarks run via `make bench-job MODE=ephemeral` (one-shot Inf2
+    that auto-terminates).  Set to false if you want the always-on
+    instance back for interactive SSH / SSM work.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "project_tag" {
   description = "Value for the Project tag applied to all resources."
   type        = string
   default     = "lqcd-neuron"
+}
+
+# ---------------------------------------------------------------------------
+# Benchmark-job options
+# ---------------------------------------------------------------------------
+variable "notification_email" {
+  description = <<-EOT
+    Email address that receives benchmark-result notifications via SNS.
+    Leave empty to skip the subscription (the SNS topic and S3 bucket are
+    still created, so you can subscribe manually later).  AWS sends a
+    one-click confirmation to the address; the subscription stays
+    'PendingConfirmation' until you click it.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.notification_email == "" || can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.notification_email))
+    error_message = "notification_email must be empty or a valid email address."
+  }
+}
+
+variable "bench_log_retention_days" {
+  description = "Number of days to retain benchmark logs in the S3 bucket before automatic deletion."
+  type        = number
+  default     = 90
+}
+
+variable "lqcd_neuron_repo_url" {
+  description = "Git URL the ephemeral bench instance clones lqcd-neuron from."
+  type        = string
+  default     = "https://github.com/JGalego/lqcd-neuron"
+}
+
+variable "lqcd_neuron_branch" {
+  description = "Git branch the ephemeral bench instance checks out before running the benchmark."
+  type        = string
+  default     = "main"
 }

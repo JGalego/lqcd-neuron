@@ -178,6 +178,41 @@ connect-bench:  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTI
 	chmod +x scripts/connect_inf2.sh
 	bash scripts/connect_inf2.sh --bench $(if $(filter 1,$(NEURON)),--neuron) $(if $(filter 1,$(NO_FUSED)),--no-fused) $(foreach l,$(LATTICE),--lattice $(l))
 
+# ---------------------------------------------------------------------------
+# Benchmark job (fire-and-forget, results emailed via SNS)
+#
+# Options:
+#   MODE=persistent   (default) reuse the existing Inf2 instance via SSM
+#   MODE=ephemeral    spin up a one-shot Inf2 that auto-terminates
+#   WAIT=1            block until the SSM command finishes (persistent only)
+#   NEURON=1          add --neuron to the bench (default: on)
+#   NO_FUSED=1        add --no-fused
+#   LATTICE="A B"     restrict to specific lattice sizes
+#
+# Examples:
+#   make bench-job
+#   make bench-job MODE=ephemeral
+#   make bench-job NEURON=1 LATTICE="16x16x16x16 24x24x24x24"
+#   make bench-job MODE=ephemeral NO_FUSED=1
+# ---------------------------------------------------------------------------
+
+MODE   ?= ephemeral
+WAIT   ?= 0
+# Default to --neuron unless explicitly disabled with NEURON=0.
+NEURON ?= 1
+
+_JOB_FLAGS  = $(if $(filter 1,$(NEURON)),--neuron)
+_JOB_FLAGS += $(if $(filter 1,$(NO_FUSED)),--no-fused)
+_JOB_FLAGS += $(foreach l,$(LATTICE),--lattice $(l))
+
+.PHONY: bench-job
+bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral] [WAIT=1]
+	chmod +x scripts/trigger_bench_job.sh
+	bash scripts/trigger_bench_job.sh \
+	    --mode $(MODE) \
+	    $(if $(filter 1,$(WAIT)),--wait) \
+	    -- $(_JOB_FLAGS)
+
 .PHONY: tfvars
 tvars:  ## Copy the example tfvars file (edit before running tofu-apply)
 	cp $(INFRA_DIR)/terraform.tfvars.example $(INFRA_DIR)/terraform.tfvars

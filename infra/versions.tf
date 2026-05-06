@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.6"   # OpenTofu 1.6+
+  required_version = ">= 1.6" # OpenTofu 1.6+
 
   required_providers {
     aws = {
@@ -13,6 +13,10 @@ terraform {
     local = {
       source  = "hashicorp/local"
       version = "~> 2.8"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
     }
   }
 

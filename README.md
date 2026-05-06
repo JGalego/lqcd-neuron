@@ -197,6 +197,27 @@ make bench NEURON=1                # Neuron vs CPU Dslash benchmark
 make connect-bench NEURON=1        # SSH into the instance and run the benchmark
 ```
 
+### Fire-and-forget bench job (results emailed)
+
+For unattended runs, `make bench-job` triggers the benchmark on AWS, archives
+the full log to S3, and emails a summary (with a 7-day presigned download
+link) via SNS.  Set `notification_email` in `infra/terraform.tfvars` and
+`tofu apply` once to wire up the topic and confirm the subscription.
+
+By default `infra/` provisions only the shared bench infra (VPC, IAM, SNS,
+S3, launch template) — no always-on instance — and `make bench-job` runs in
+ephemeral mode: a one-shot Inf2 that runs the benchmark, emails the result,
+and self-terminates.  Set `skip_persistent_instance = false` in
+`terraform.tfvars` if you want the long-running instance back for
+interactive SSH/SSM work; `MODE=persistent` then becomes available.
+
+```bash
+make bench-job                                    # ephemeral one-shot Inf2 (default)
+make bench-job MODE=persistent                    # SSM RunCommand on the long-running instance
+make bench-job NEURON=1 LATTICE="16x16x16x16"     # restrict to one lattice
+make bench-job MODE=persistent WAIT=1             # block until the SSM command finishes
+```
+
 ### Profiling & monitoring
 
 Use the Neuron SDK's built-in tools directly:
