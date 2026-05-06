@@ -304,3 +304,9 @@ Two key Terraform knobs:
   spins up a fresh Inf2 per run.  Set to `false` to bring the always-on
   instance back for interactive SSH/SSM work; `MODE=persistent` then
   becomes available for SSM RunCommand.
+
+Ephemeral runs also schedule a `shutdown -h +120` wallclock kill switch
+at boot as a belt-and-braces safety net (in addition to
+`instance_initiated_shutdown_behavior=terminate`).  Override per run with
+`make bench-job MODE=ephemeral WALLCLOCK=<minutes>`; `WALLCLOCK=0`
+disables the timer entirely for long sweeps.

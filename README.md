@@ -228,7 +228,15 @@ make bench-job MODE=persistent                    # SSM RunCommand on the long-r
 make bench-job NEURON=1 LATTICE="16x16x16x16"     # restrict to one lattice
 make bench-job NEURON=1 BATCH=1,8,32,64           # sweep batch sizes
 make bench-job MODE=persistent WAIT=1             # block until the SSM command finishes
+make bench-job MODE=ephemeral WALLCLOCK=480       # raise the 120-min wallclock kill switch (0 = disable)
 ```
+
+Ephemeral runs schedule a `shutdown -h +120` at boot as a hard wallclock
+kill switch.  Long sweeps that exceed two hours will see
+`The system is going down for poweroff …` wall messages and get cut off;
+bump or disable the timer with `WALLCLOCK=<minutes>` (or `WALLCLOCK=0`).
+The instance still self-terminates at the end of the run via
+`instance_initiated_shutdown_behavior=terminate`.
 
 Partial results stream to S3 as each `(lattice, batch_size)` finishes, so
 you don't have to wait for the full sweep to land in your inbox.  The

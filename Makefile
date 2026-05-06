@@ -192,12 +192,15 @@ connect-bench:  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTI
 #   NEURON=1          add --neuron to the bench (default: on)
 #   NO_FUSED=1        add --no-fused
 #   LATTICE="A B"     restrict to specific lattice sizes
+#   WALLCLOCK=N       ephemeral wallclock kill switch in minutes
+#                     (default 120; set 0 to disable for long sweeps)
 #
 # Examples:
 #   make bench-job
 #   make bench-job MODE=ephemeral
 #   make bench-job NEURON=1 LATTICE="16x16x16x16 24x24x24x24"
 #   make bench-job MODE=ephemeral NO_FUSED=1
+#   make bench-job MODE=ephemeral WALLCLOCK=480
 # ---------------------------------------------------------------------------
 
 MODE   ?= ephemeral
@@ -211,11 +214,12 @@ _JOB_FLAGS += $(foreach l,$(LATTICE),--lattice $(l))
 _JOB_FLAGS += $(if $(BATCH),--batch-sizes $(BATCH))
 
 .PHONY: bench-job
-bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral] [WAIT=1]
+bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral] [WAIT=1] [WALLCLOCK=min]
 	chmod +x scripts/trigger_bench_job.sh
 	bash scripts/trigger_bench_job.sh \
 	    --mode $(MODE) \
 	    $(if $(filter 1,$(WAIT)),--wait) \
+	    $(if $(WALLCLOCK),--wallclock-minutes $(WALLCLOCK)) \
 	    -- $(_JOB_FLAGS)
 
 # ---------------------------------------------------------------------------

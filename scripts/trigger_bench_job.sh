@@ -18,9 +18,16 @@
 # Usage:
 #   bash scripts/trigger_bench_job.sh                    # persistent, --neuron
 #   bash scripts/trigger_bench_job.sh --mode ephemeral
+#   bash scripts/trigger_bench_job.sh --mode ephemeral --wallclock-minutes 480
 #   bash scripts/trigger_bench_job.sh -- --no-fused --lattice 16x16x16x16
 #
 # Anything after `--` is forwarded verbatim to bench_dslash.py.
+#
+# Long-running ephemeral benches: the default 120-minute wallclock kill
+# switch is what triggers "The system is going down for poweroff …"
+# wall messages.  Bump it (or pass 0 to disable) for big sweeps:
+#   make bench-job MODE=ephemeral WALLCLOCK=480
+#   LQCD_BENCH_WALLCLOCK_MIN=0 make bench-job MODE=ephemeral
 
 set -euo pipefail
 
@@ -31,6 +38,10 @@ MODE="persistent"
 WAIT=0
 BENCH_ARGS_DEFAULT="--neuron"
 BENCH_ARGS=""
+# Hard wallclock kill switch for ephemeral runs, in minutes.  The instance
+# is force-shutdown after this long no matter what.  Override with
+# --wallclock-minutes or LQCD_BENCH_WALLCLOCK_MIN.  Set to 0 to disable.
+WALLCLOCK_MIN="${LQCD_BENCH_WALLCLOCK_MIN:-120}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --persistent)  MODE="persistent"; shift ;;
         --ephemeral)   MODE="ephemeral"; shift ;;
         --wait)        WAIT=1; shift ;;
+        --wallclock-minutes) WALLCLOCK_MIN="$2"; shift 2 ;;
         --)            shift; BENCH_ARGS="$*"; break ;;
         -h|--help)
             sed -n '2,30p' "$0"; exit 0 ;;
@@ -46,6 +58,11 @@ while [[ $# -gt 0 ]]; do
             BENCH_ARGS="${BENCH_ARGS} $1"; shift ;;
     esac
 done
+
+if ! [[ "${WALLCLOCK_MIN}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --wallclock-minutes must be a non-negative integer (got '${WALLCLOCK_MIN}')." >&2
+    exit 1
+fi
 
 BENCH_ARGS="$(echo "${BENCH_ARGS:-${BENCH_ARGS_DEFAULT}}" | xargs)"
 
@@ -126,6 +143,7 @@ log "Region      : ${AWS_REGION}"
 log "SNS topic   : ${SNS_ARN}"
 log "S3 bucket   : ${S3_BUCKET}"
 log "Bench args  : ${BENCH_ARGS}"
+log "Wallclock   : ${WALLCLOCK_MIN} min$([[ "${WALLCLOCK_MIN}" -eq 0 ]] && echo ' (disabled)')"
 
 # ---------------------------------------------------------------------------
 # Persistent: send via SSM RunCommand
@@ -215,6 +233,14 @@ Q_AWS_REGION=$(printf '%q' "${AWS_REGION}")
 Q_REPO_URL=$(printf  '%q' "${REPO_URL}")
 Q_BRANCH=$(printf    '%q' "${BRANCH}")
 
+# Render the wallclock kill switch.  Setting WALLCLOCK_MIN=0 disables it
+# entirely (long sweeps); otherwise schedule a `shutdown -h +N` at boot.
+if [[ "${WALLCLOCK_MIN}" -eq 0 ]]; then
+    WALLCLOCK_LINE='echo "[user-data] wallclock kill switch disabled (WALLCLOCK_MIN=0)"'
+else
+    WALLCLOCK_LINE="shutdown -h +${WALLCLOCK_MIN} \"lqcd-neuron bench wallclock\" || true"
+fi
+
 # Embed the on-instance bench script directly so the ephemeral box does not
 # depend on the orchestration script being pushed (only the bench code does).
 SCRIPT_PATH="${REPO_ROOT}/scripts/run_bench_job.sh"
@@ -232,9 +258,10 @@ exec > >(tee /var/log/lqcd-bench-userdata.log) 2>&1
 echo "[user-data] starting at \$(date -u --iso-8601=seconds)"
 
 # Hard wallclock kill switch: no matter what wedges below, the instance
-# dies in 2 hours.  Cancellable from inside the workload via 'shutdown -c'
-# if a longer run is ever needed.
-shutdown -h +120 "lqcd-neuron bench wallclock" || true
+# dies after WALLCLOCK_MIN minutes (default 120).  Cancellable from inside
+# the workload via 'shutdown -c'; pass --wallclock-minutes 0 (or
+# WALLCLOCK=0 via the Makefile) to disable for long sweeps.
+${WALLCLOCK_LINE}
 
 # Belt-and-braces teardown: fires on success, error, or signal.  Replaces
 # the old trailing 'shutdown' which 'set -e' could skip on bootstrap failure.

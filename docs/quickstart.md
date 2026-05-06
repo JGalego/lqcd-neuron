@@ -272,12 +272,16 @@ batches.
 ```bash
 make connect-bench NEURON=1 BATCH=1,8,32   # SSH to the instance, run there
 make bench-job NEURON=1 BATCH=1,8,32,64    # one-shot Inf2, results emailed
+make bench-job WALLCLOCK=480               # long sweep: 8h kill switch (0 disables)
 ```
 
 `make bench-job` provisions an ephemeral Inf2 from the bench launch template
 defined in [infra/main.tf](../infra/main.tf), runs the benchmark, archives
 the full log to S3, emails a summary (with a 7-day presigned download URL)
-via SNS, and self-terminates.  See the
+via SNS, and self-terminates.  A 120-minute wallclock kill switch fires at
+boot as a safety net; raise it with `WALLCLOCK=<minutes>` (or set
+`WALLCLOCK=0` to disable) for long sweeps that would otherwise trigger
+`The system is going down for poweroff …` wall messages.  See the
 ["Fire-and-forget bench job"](../README.md#fire-and-forget-bench-job-results-emailed)
 section of the top-level README for the full setup (notably:
 `notification_email` in `terraform.tfvars` plus a one-click confirmation of
