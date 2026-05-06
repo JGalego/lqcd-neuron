@@ -175,8 +175,10 @@ host-side loop — is dominated by overheads that don’t exist on a CPU baselin
 - Each forward call pays a fixed ~1 ms NeuronCore dispatch cost regardless of
   problem size.
 
-`NeuronCompiler.compile_dslash()` and `compile_dslash_batched()` apply three
-optimisations to remove these:
+`NeuronCompiler.compile_dslash()` and `compile_dslash_batched()` apply four
+throughput optimisations to remove these — plus a fifth, **spatial
+sharding**, that addresses a separate compile-time constraint (the
+`neuronx-cc` per-NEFF HLO instruction budget) rather than a runtime cost:
 
 ### 1. Gauge baking
 
@@ -241,6 +243,58 @@ shard multiplies that by the number of cores on the instance (2 on
 `_MultiCoreDslashWrapper` validates the global batch size and otherwise
 presents the same `forward(psi)` signature as the single-core batched
 path.
+
+### 5. Spatial sharding (T-axis domain decomposition)
+
+Large lattices ($V \gtrsim 24^4 \approx 3.3 \times 10^5$ sites) overflow
+the per-NEFF `neuronx-cc` HLO instruction budget (~5M instructions,
+[NCC_EVRF007]) even with the unfused baked-gauge path.  At $32^4$ the
+unfused graph emits ~34M HLO instructions — about $7\times$ the budget —
+and the compile fails outright.
+
+`compile_dslash_sharded(D, shape, gauge_field=U, num_shards=k)` brings the
+per-graph cost back into range by splitting the lattice along the slowest
+axis (T) into `num_shards` equal slabs of size $T_\text{local} = T/k$.
+Each shard compiles to its own NEFF operating on a
+$(T_\text{local}, Z, Y, X)$ sub-volume — the same per-graph instruction
+count as a single-shard compile of that smaller volume.  When `num_shards`
+is omitted the smallest power-of-2 factor of $T$ that satisfies
+$V_\text{local} \le 24^4$ is selected automatically.
+
+*Halo exchange.*  $Z$, $Y$, $X$ axes stay local to each shard and use
+ordinary `torch.roll`.  For the sharded $T$ axis the boundary neighbours
+come from adjacent shards via host-side gather under periodic BCs:
+
+$$
+\psi_s(t = T_\text{local}-1)_\text{fwd}
+  \;\leftarrow\; \psi\bigl((s+1) T_\text{local} \bmod T\bigr), \qquad
+\psi_s(t = 0)_\text{bwd}
+  \;\leftarrow\; \psi\bigl(s T_\text{local} - 1 \bmod T\bigr)
+$$
+
+The shard adapter splices these one-slab halos into the local spinor with
+`torch.cat` instead of rolling on $T$, so no wrap-around occurs at the
+shard boundary.  Each shard's NEFF additionally bakes one extra slab of
+$U(t-1, \mu=0)$ (the backward-T link at the shard's left boundary), so the
+backward-$T$ hop at $t_\text{local}=0$ is computed without needing the
+previous shard's full gauge field.
+
+*Auto-routing.*  `compile_dslash` checks the global volume after deciding
+between fused and unfused, and when $V > 24^4$ in the unfused branch it
+silently delegates to `compile_dslash_sharded` with the auto-picked
+`num_shards`.  The user's existing `forward(psi, U)` call site keeps
+working unchanged.
+
+*Trade-offs and limitations.*  The current implementation dispatches the
+`k` shards sequentially on a single NeuronCore, so wall-clock throughput
+at $32^4$ is roughly $1/k$ of what a hypothetical $32^4$-resident NEFF
+would reach — sharding restores compilability, not peak throughput.
+Follow-up work: (a) one-shard-per-core parallel dispatch (each shard's
+NEFF loaded on a different NeuronCore, halos exchanged host-side); and
+(b) sharded multi-RHS for `compile_dslash_batched` / `_multicore`, which
+currently still error on $32^4$.  Cuts along $Z$/$Y$/$X$ are not
+implemented; T was chosen as the natural slow axis to keep the spatial
+rolls fully local.
 
 ### Verifying correctness
 

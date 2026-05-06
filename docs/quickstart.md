@@ -219,6 +219,42 @@ shard crosses PCIe per core per call.  This stacks with multi-RHS
 batching: each core still runs the fused 12×12 batched kernel on its
 `per_core_batch_size` slice.
 
+### Large lattices (V > 24⁴): spatial sharding
+
+At $V \gtrsim 24^4$ the single-NEFF graph overflows the `neuronx-cc` HLO
+instruction budget (`[NCC_EVRF007]`).  `compile_dslash` detects this and
+auto-routes through `compile_dslash_sharded`, which splits the lattice
+along the T axis into `num_shards` slabs and compiles one NEFF per slab.
+Halos are gathered host-side under periodic BCs.  No call-site change is
+needed:
+
+```python
+# 32^4 — auto-shards into 4 slabs of (T_local=8, 32, 32, 32)
+D_big = compiler.compile_dslash(
+    D, lattice_shape=(32, 32, 32, 32),
+    nc=geom.nc, gauge_field=U_big.tensor,
+)
+out = D_big(psi_big.tensor, U_big.tensor)
+```
+
+To control the partition explicitly:
+
+```python
+D_big = compiler.compile_dslash_sharded(
+    D, lattice_shape=(32, 32, 32, 32),
+    gauge_field=U_big.tensor,
+    num_shards=4,        # must divide T; default picks the smallest
+                         # power-of-2 keeping V_local ≤ 24^4
+    nc=geom.nc,
+)
+```
+
+The shards currently dispatch sequentially on a single NeuronCore, so
+this path restores *compilability* at large $V$ rather than peak
+throughput.  Multi-RHS (`compile_dslash_batched`) and the multicore
+data-parallel path do not yet support sharding and will still fail on
+lattices that overflow the per-NEFF budget.
+
 > **Note:** the `.neff` produced by the gauge-baked path is specific to the
 > exact gauge configuration passed in.  Re-compile (cheap once warm) when `U`
 > changes between solves.

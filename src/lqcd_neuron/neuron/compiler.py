@@ -840,6 +840,313 @@ class _HalfLatticeDslashWrapper(nn.Module):
         return torch.complex(r_re.float(), r_im.float())
 
 
+# ---------------------------------------------------------------------------
+# Spatial sharding (T-axis domain decomposition)
+# ---------------------------------------------------------------------------
+#
+# Large lattices (V >~ 24^4) overflow the per-NeuronCore HLO instruction
+# budget of neuronx-cc, even with the unfused baked-gauge path:
+#
+#   [NCC_EVRF007] Instructions generated 33,776,000 exceeds typical limit
+#   of 5,000,000.
+#
+# We bring the per-graph instruction count back into range by sharding the
+# lattice along the T (slowest) axis into ``num_shards`` slabs of size
+# ``T_local = T // num_shards``.  Each shard compiles to its own NEFF
+# operating on a ``(T_local, Z, Y, X)`` sub-volume — the same per-graph cost
+# as a ``(T_local * Z * Y * X)``-volume single-shard compile.
+#
+# Standard ``torch.roll`` handles the Z, Y, X axes locally (each shard owns
+# all sites along those axes).  For the sharded T axis the boundary
+# neighbours come from adjacent shards via host-side halo gather:
+#
+#   psi(local t = T_local-1).fwd  ←  psi(global t = (s+1)*T_local % T)
+#   psi(local t = 0).bwd          ←  psi(global t = (s*T_local - 1) % T)
+#
+# The host wrapper assembles a one-slab halo on each side, the compiled
+# shard adapter splices halos in via ``torch.cat`` (no roll on T), and the
+# result is reassembled by concatenating shard outputs along T.
+#
+# Periodic BCs across the global T axis are preserved automatically because
+# the host computes halo indices modulo T.
+#
+# Limitations of this initial implementation
+# ------------------------------------------
+# • Sequential per-shard dispatch on a single NeuronCore.  A multi-core
+#   parallel variant (one shard per core) is a follow-up — it would require
+#   per-shard NEFFs (different baked U) loaded into different cores.
+# • Single-RHS only.  Multi-RHS sharded execution is also a follow-up.
+# • Sharding along T only (no Z/Y/X cuts).  T is the natural slow axis and
+#   keeps the spatial axes fully local, matching the QUDA convention.
+# ---------------------------------------------------------------------------
+
+
+def _shard_T_indices(T: int, num_shards: int) -> Tuple[int, int]:
+    """Return (T_local, num_shards) after validating divisibility."""
+    if T % num_shards != 0:
+        raise ValueError(
+            f"Spatial sharding requires T={T} divisible by num_shards="
+            f"{num_shards}.  Try a power-of-2 num_shards that divides T."
+        )
+    return T // num_shards, num_shards
+
+
+class _ShardedBakedGaugeAdapter(nn.Module):
+    """Halo-aware Wilson hop on a T-sharded sub-volume.
+
+    Bakes the local gauge slab and one extra slab of ``U(t-1, μ=0)`` (the
+    backward-T link at the shard's left boundary) as NeuronCore-resident
+    buffers.  Inputs are the local spinor plus two one-slab halos:
+
+        psi_re/im     : (T_local, Z, Y, X, Ns, Nc)
+        halo_l_re/im  : (1,       Z, Y, X, Ns, Nc)   — psi(global t0-1)
+        halo_r_re/im  : (1,       Z, Y, X, Ns, Nc)   — psi(global t1)
+
+    For Z/Y/X axes ``torch.roll`` works locally.  For the T axis, the
+    forward/backward neighbours are spliced in via ``torch.cat`` so no
+    wrap-around occurs at the shard boundary.
+    """
+
+    def __init__(
+        self,
+        U_local_re: torch.Tensor, U_local_im: torch.Tensor,
+        U_tm1_mu0_re: torch.Tensor, U_tm1_mu0_im: torch.Tensor,
+        diag: float,
+        nc: int,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("U_local_re", U_local_re)
+        self.register_buffer("U_local_im", U_local_im)
+        self.register_buffer("U_tm1_mu0_re", U_tm1_mu0_re)
+        self.register_buffer("U_tm1_mu0_im", U_tm1_mu0_im)
+        self.diag = float(diag)
+        self.nc = nc
+
+        # Spin projectors — same construction as _NeuronWilsonDslashAdapter.
+        from ..dirac.gamma import degrand_rossi_gammas
+        G  = degrand_rossi_gammas(dtype=torch.complex64)
+        I4 = torch.eye(4, dtype=torch.complex64)
+        P_minus = torch.stack([I4 - G[mu] for mu in range(4)], dim=0)
+        P_plus  = torch.stack([I4 + G[mu] for mu in range(4)], dim=0)
+        self.register_buffer("P_minus_re", P_minus.real.float())
+        self.register_buffer("P_minus_im", P_minus.imag.float())
+        self.register_buffer("P_plus_re",  P_plus.real.float())
+        self.register_buffer("P_plus_im",  P_plus.imag.float())
+
+    @staticmethod
+    def _color_mv(U_re, U_im, v_re, v_im):
+        r_re = (torch.einsum("...ij,...sj->...si", U_re, v_re)
+                - torch.einsum("...ij,...sj->...si", U_im, v_im))
+        r_im = (torch.einsum("...ij,...sj->...si", U_re, v_im)
+                + torch.einsum("...ij,...sj->...si", U_im, v_re))
+        return r_re, r_im
+
+    @staticmethod
+    def _color_dag_mv(U_re, U_im, v_re, v_im):
+        r_re = (torch.einsum("...ji,...sj->...si", U_re, v_re)
+                + torch.einsum("...ji,...sj->...si", U_im, v_im))
+        r_im = (torch.einsum("...ji,...sj->...si", U_re, v_im)
+                - torch.einsum("...ji,...sj->...si", U_im, v_re))
+        return r_re, r_im
+
+    @staticmethod
+    def _spin_mv(P_re, P_im, v_re, v_im):
+        r_re = (torch.einsum("ij,...jk->...ik", P_re, v_re)
+                - torch.einsum("ij,...jk->...ik", P_im, v_im))
+        r_im = (torch.einsum("ij,...jk->...ik", P_re, v_im)
+                + torch.einsum("ij,...jk->...ik", P_im, v_re))
+        return r_re, r_im
+
+    def forward(
+        self,
+        psi_re: torch.Tensor, psi_im: torch.Tensor,
+        hl_re: torch.Tensor,  hl_im: torch.Tensor,
+        hr_re: torch.Tensor,  hr_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        result_re = self.diag * psi_re
+        result_im = self.diag * psi_im
+
+        for mu in range(4):
+            U_mu_re = self.U_local_re[..., mu, :, :]
+            U_mu_im = self.U_local_im[..., mu, :, :]
+            # Lattice axes T,Z,Y,X live at positions -6..-3 of psi.
+            ldim = mu - 6
+
+            if mu == 0:
+                # T axis: splice halos instead of rolling.
+                #   pf[t] = psi[t+1] for t<T_local-1, hr[0] for t=T_local-1
+                #   pb[t] = psi[t-1] for t>0,        hl[0] for t=0
+                pf_re = torch.cat([psi_re[1:], hr_re], dim=0)
+                pf_im = torch.cat([psi_im[1:], hr_im], dim=0)
+                pb_re = torch.cat([hl_re, psi_re[:-1]], dim=0)
+                pb_im = torch.cat([hl_im, psi_im[:-1]], dim=0)
+                # Backward link U†(t-1, μ=0) at output site t:
+                #   for local t=0    → U_tm1_mu0 (baked from previous shard)
+                #   for local t>0    → U_local at local t-1, μ=0
+                Ub_re = torch.cat([self.U_tm1_mu0_re, U_mu_re[:-1]], dim=0)
+                Ub_im = torch.cat([self.U_tm1_mu0_im, U_mu_im[:-1]], dim=0)
+            else:
+                pf_re = torch.roll(psi_re, -1, dims=ldim)
+                pf_im = torch.roll(psi_im, -1, dims=ldim)
+                pb_re = torch.roll(psi_re,  1, dims=ldim)
+                pb_im = torch.roll(psi_im,  1, dims=ldim)
+                Ub_re = torch.roll(U_mu_re, 1, dims=ldim)
+                Ub_im = torch.roll(U_mu_im, 1, dims=ldim)
+
+            # Forward hop:  − ½ (I − γ_μ) U(x,μ) ψ(x+μ̂)
+            Upf_re, Upf_im = self._color_mv(U_mu_re, U_mu_im, pf_re, pf_im)
+            cf_re,  cf_im  = self._spin_mv(
+                self.P_minus_re[mu], self.P_minus_im[mu], Upf_re, Upf_im
+            )
+            # Backward hop: − ½ (I + γ_μ) U†(x−μ̂,μ) ψ(x−μ̂)
+            Upb_re, Upb_im = self._color_dag_mv(Ub_re, Ub_im, pb_re, pb_im)
+            cb_re,  cb_im  = self._spin_mv(
+                self.P_plus_re[mu], self.P_plus_im[mu], Upb_re, Upb_im
+            )
+
+            result_re = result_re - 0.5 * (cf_re + cb_re)
+            result_im = result_im - 0.5 * (cf_im + cb_im)
+
+        return result_re, result_im
+
+
+def _slice_shard_gauge(
+    U_full: torch.Tensor,
+    shard_idx: int,
+    num_shards: int,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(U_local_re, U_local_im, U_tm1_mu0_re, U_tm1_mu0_im)`` for shard.
+
+    *U_local* covers the shard's interior global rows ``[t0, t1)``.  The
+    extra ``U_tm1_mu0`` slab carries the μ=0 link at ``global t = t0-1``
+    (modulo T) so the shard adapter can compute the backward-T hop at its
+    leftmost local row without needing the previous shard's full gauge.
+    """
+    T_full = U_full.shape[0]
+    T_local, _ = _shard_T_indices(T_full, num_shards)
+    t0 = shard_idx * T_local
+    t1 = t0 + T_local
+
+    # Local U(t0..t1-1, *, *, *, μ, c, c).
+    U_local = U_full[t0:t1].contiguous()
+    # Extra μ=0 slab at global (t0 - 1) % T_full, with the slab dim retained.
+    tm1 = (t0 - 1) % T_full
+    U_tm1_mu0 = U_full[tm1:tm1 + 1, :, :, :, 0, :, :].contiguous()
+
+    return (
+        U_local.real.to(dtype).contiguous(),
+        U_local.imag.to(dtype).contiguous(),
+        U_tm1_mu0.real.to(dtype).contiguous(),
+        U_tm1_mu0.imag.to(dtype).contiguous(),
+    )
+
+
+class _ShardedDslashWrapper(nn.Module):
+    """Host orchestrator for T-axis sharded Dslash execution.
+
+    Splits a full-lattice complex64 spinor along T into ``num_shards``
+    slabs, gathers one-slab halos from neighbour shards under periodic
+    boundary conditions, dispatches each shard's compiled adapter
+    sequentially, and concatenates the per-shard outputs along T.
+
+    Args:
+        shard_modules:    List of compiled (or eager) shard adapters,
+                          one per shard.  Each is a callable
+                          ``(psi_re, psi_im, hl_re, hl_im, hr_re, hr_im)``
+                          returning ``(result_re, result_im)``.
+        num_shards:       Number of T-slabs.
+        T_local:          Sites per slab (T // num_shards).
+        compute_dtype:    Internal real dtype for the dispatched call.
+    """
+
+    def __init__(
+        self,
+        shard_modules,
+        num_shards: int,
+        T_local: int,
+        compute_dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        # Use a plain Python list to avoid nn.ModuleList trying to register
+        # ScriptModules from torch_neuronx.trace as submodules (not always safe).
+        self._shard_modules = list(shard_modules)
+        self.num_shards = num_shards
+        self.T_local = T_local
+        self._compute_dtype = compute_dtype
+
+    @torch.inference_mode()
+    def forward(self, psi: torch.Tensor, U: torch.Tensor = None) -> torch.Tensor:
+        # Standard (psi, U) signature for drop-in compatibility; U is ignored
+        # because the gauge field is baked into each shard's compiled module.
+        del U
+        dt = self._compute_dtype
+        T = psi.shape[0]
+        if T != self.num_shards * self.T_local:
+            raise ValueError(
+                f"_ShardedDslashWrapper: psi T-extent {T} does not match "
+                f"num_shards * T_local = {self.num_shards} * {self.T_local}."
+            )
+
+        # Pre-split the full spinor along T into shard slabs once on the host.
+        psi_re = psi.real.to(dt).contiguous()
+        psi_im = psi.imag.to(dt).contiguous()
+
+        out_re_shards = []
+        out_im_shards = []
+        for s, shard_mod in enumerate(self._shard_modules):
+            t0 = s * self.T_local
+            t1 = t0 + self.T_local
+
+            local_re = psi_re[t0:t1].contiguous()
+            local_im = psi_im[t0:t1].contiguous()
+
+            # Periodic halos.
+            l_idx = (t0 - 1) % T
+            r_idx = t1 % T
+            hl_re = psi_re[l_idx:l_idx + 1].contiguous()
+            hl_im = psi_im[l_idx:l_idx + 1].contiguous()
+            hr_re = psi_re[r_idx:r_idx + 1].contiguous()
+            hr_im = psi_im[r_idx:r_idx + 1].contiguous()
+
+            r_re, r_im = shard_mod(local_re, local_im, hl_re, hl_im, hr_re, hr_im)
+            out_re_shards.append(r_re.float())
+            out_im_shards.append(r_im.float())
+
+        out_re = torch.cat(out_re_shards, dim=0)
+        out_im = torch.cat(out_im_shards, dim=0)
+        return torch.complex(out_re, out_im)
+
+
+# Default per-shard volume cap.  Empirically 24^4 = 331,776 sites is the
+# largest single-NEFF compile that fits the neuronx-cc ~5M HLO instruction
+# budget for the unfused baked-gauge Dslash; 32^4 (~1.05M sites) overshoots
+# by ~7×.  Used to auto-pick num_shards when callers don't specify.
+_DEFAULT_SHARD_VOLUME_CAP = 24 ** 4
+
+
+def _auto_num_shards(lattice_shape: Tuple[int, int, int, int]) -> int:
+    """Smallest power-of-2 num_shards along T that brings V_local ≤ cap.
+
+    Returns 1 when the full lattice already fits the per-NEFF budget.
+    """
+    T, Z, Y, X = lattice_shape
+    V = T * Z * Y * X
+    if V <= _DEFAULT_SHARD_VOLUME_CAP:
+        return 1
+    n = 1
+    while V // n > _DEFAULT_SHARD_VOLUME_CAP and n < T:
+        n *= 2
+        if T % n != 0:
+            # Fall back to the largest divisor of T that is ≤ n.
+            for cand in range(n, 1, -1):
+                if T % cand == 0:
+                    n = cand
+                    break
+            break
+    return max(1, min(n, T))
+
+
 class NeuronCompiler:
     """Compile ``nn.Module`` operators for execution on Neuron hardware.
 
@@ -1131,6 +1438,27 @@ class NeuronCompiler:
                 # set per call is ~12× smaller than the fused (Ns*Nc)² kernels,
                 # so this path can outperform the fused one once the latter
                 # overflows NeuronCore on-chip memory.
+                #
+                # For very large lattices (V > 24^4 ≈ 331k sites) even the
+                # unfused single-NEFF graph blows past the neuronx-cc HLO
+                # instruction budget (~5M instructions), so we hand off to
+                # the T-axis sharded path which compiles one NEFF per slab.
+                if T * Z * Y * X > _DEFAULT_SHARD_VOLUME_CAP:
+                    auto_n = _auto_num_shards(lattice_shape)
+                    logger.warning(
+                        "compile_dslash: V=%d exceeds per-NEFF HLO budget "
+                        "(cap=%d sites) — auto-routing through "
+                        "compile_dslash_sharded with num_shards=%d "
+                        "(T_local=%d).  Pass num_shards explicitly via "
+                        "compile_dslash_sharded() to override.",
+                        T * Z * Y * X, _DEFAULT_SHARD_VOLUME_CAP,
+                        auto_n, T // auto_n,
+                    )
+                    return self.compile_dslash_sharded(
+                        dslash_module, lattice_shape, gauge_field,
+                        num_shards=auto_n, nc=nc, ns=ns,
+                    )
+
                 adapter = adapter.to(dt)
                 U_re = gauge_field.real.to(dt).contiguous()
                 U_im = gauge_field.imag.to(dt).contiguous()
@@ -1345,6 +1673,114 @@ class NeuronCompiler:
         psi_im = torch.zeros_like(psi_re)
         compiled = self.compile(adapter, (psi_re, psi_im))
         return _HalfLatticeDslashWrapper(compiled, compute_dtype=dt)
+
+    def compile_dslash_sharded(
+        self,
+        dslash_module: nn.Module,
+        lattice_shape: Tuple[int, int, int, int],
+        gauge_field: torch.Tensor,
+        num_shards: Optional[int] = None,
+        nc: int = 3,
+        ns: int = 4,
+    ) -> nn.Module:
+        """Compile a Dslash with the lattice T-axis split into ``num_shards``.
+
+        Each shard handles a ``(T // num_shards, Z, Y, X)`` sub-volume and
+        compiles to its own NEFF.  Per-shard HLO instruction count scales
+        with ``T_local`` rather than ``T``, restoring compilability for
+        lattices that overflow the single-NEFF ``neuronx-cc`` budget
+        (typically ``V > 24^4``).
+
+        Halo exchange across the sharded T axis happens host-side via
+        :class:`_ShardedDslashWrapper` under periodic boundary conditions.
+        Z/Y/X axes stay local to each shard and use ordinary ``torch.roll``.
+
+        On non-Neuron hardware the original *dslash_module* is returned
+        unchanged — sharding is purely a Neuron compile-budget workaround
+        and adds nothing on CPU.
+
+        Args:
+            dslash_module: ``WilsonDslash`` or ``WilsonDirac`` instance.
+            lattice_shape: ``(T, Z, Y, X)`` full-lattice extents.
+            gauge_field:   Full-lattice ``complex64`` tensor
+                           ``(T, Z, Y, X, 4, Nc, Nc)``.  Each shard's NEFF
+                           bakes the corresponding T-slab plus one extra
+                           slab from the previous shard for the boundary
+                           backward link.
+            num_shards:    Number of T-slabs.  Must divide *T*.  When
+                           ``None`` (default) chosen automatically so that
+                           ``V_local ≤ 24^4`` (the empirical per-NEFF
+                           compile budget for the unfused path).
+            nc:            Number of colours.
+            ns:            Number of spin components.
+
+        Returns:
+            Module with the standard ``forward(psi, U)`` signature.  *U*
+            is accepted but ignored — the gauge field is already baked
+            into each shard's NEFF.
+        """
+        from ..dirac.wilson import WilsonDirac, WilsonDslash
+
+        T, Z, Y, X = lattice_shape
+
+        if not self._device.is_neuron:
+            logger.info(
+                "No Neuron hardware detected — compile_dslash_sharded "
+                "returning the original CPU module unchanged."
+            )
+            return dslash_module
+
+        if num_shards is None:
+            num_shards = _auto_num_shards(lattice_shape)
+        T_local, num_shards = _shard_T_indices(T, num_shards)
+
+        if isinstance(dslash_module, WilsonDirac):
+            diag = 4.0 + dslash_module.mass
+        elif isinstance(dslash_module, WilsonDslash):
+            diag = 0.0
+        else:
+            raise TypeError(
+                f"compile_dslash_sharded: unsupported module type "
+                f"{type(dslash_module).__name__}.  Only WilsonDslash and "
+                f"WilsonDirac are currently supported."
+            )
+
+        dt = self.torch_dtype
+        cpu = torch.device("cpu")
+
+        logger.info(
+            "compile_dslash_sharded: V=%d sharded along T into %d slabs of "
+            "T_local=%d (V_local=%d).  Compiling %d separate NEFFs …",
+            T * Z * Y * X, num_shards, T_local, T_local * Z * Y * X, num_shards,
+        )
+
+        shard_modules = []
+        for s in range(num_shards):
+            U_l_re, U_l_im, U_tm1_re, U_tm1_im = _slice_shard_gauge(
+                gauge_field, s, num_shards, dtype=dt,
+            )
+            adapter = _ShardedBakedGaugeAdapter(
+                U_l_re, U_l_im, U_tm1_re, U_tm1_im,
+                diag=diag, nc=nc,
+            ).to(dt)
+            psi_re = torch.zeros(T_local, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+            psi_im = torch.zeros_like(psi_re)
+            hl_re  = torch.zeros(1, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+            hl_im  = torch.zeros_like(hl_re)
+            hr_re  = torch.zeros_like(hl_re)
+            hr_im  = torch.zeros_like(hl_re)
+            # Per-shard NEFF embeds shard-specific baked U; no cache key.
+            compiled = self.compile(
+                adapter, (psi_re, psi_im, hl_re, hl_im, hr_re, hr_im)
+            )
+            shard_modules.append(compiled)
+
+        return _ShardedDslashWrapper(
+            shard_modules,
+            num_shards=num_shards,
+            T_local=T_local,
+            compute_dtype=dt,
+        )
 
     def compile_observable(
         self,

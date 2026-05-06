@@ -45,7 +45,7 @@ graph TD
     %% ── neuron ───────────────────────────────────────────────────────────────
     subgraph NEURON["neuron/"]
         ND["NeuronDevice\nTrn1 / Inf2 / CPU fallback"]
-        NC["NeuronCompiler\ntorch_neuronx.trace wrapper\ngauge-baking + fused kernels\ncompile_dslash_batched\ncompile_dslash_multicore"]
+        NC["NeuronCompiler\ntorch_neuronx.trace wrapper\ngauge-baking + fused kernels\ncompile_dslash_batched\ncompile_dslash_multicore\ncompile_dslash_sharded (T-axis)"]
     end
 
     %% ── compilation pipeline ─────────────────────────────────────────────────
