@@ -1684,6 +1684,36 @@ class NeuronCompiler:
         dt = self.torch_dtype
         cpu = torch.device("cpu")
 
+        # Guard rails — the batched path has no unfused or sharded fallback
+        # of its own, so fail fast with an actionable message instead of
+        # spending a long compile only to die in neuronx-cc.
+        V = T * Z * Y * X
+        sram_budget = (
+            self.sram_threshold_bytes
+            or int(_NC2_SRAM_BYTES * _FUSED_SRAM_BUDGET)
+        )
+        kb = _fused_kernel_bytes(lattice_shape, ns=ns, nc=nc, dtype=dt)
+        if kb > sram_budget:
+            raise RuntimeError(
+                f"compile_dslash_batched: fused kernels "
+                f"({kb / 1024**2:.1f} MiB) exceed SRAM budget "
+                f"({sram_budget / 1024**2:.1f} MiB) for lattice "
+                f"{lattice_shape}.  The batched path has no unfused "
+                "fallback — try compile_dslash_eo (halves V), reduce the "
+                "lattice, or call compile_dslash (single-RHS, with auto "
+                "fallbacks) in a host-side loop."
+            )
+        if V > _DEFAULT_SHARD_VOLUME_CAP:
+            raise RuntimeError(
+                f"compile_dslash_batched: V={V} exceeds per-NEFF HLO "
+                f"instruction budget (cap={_DEFAULT_SHARD_VOLUME_CAP} sites) "
+                f"for lattice {lattice_shape}.  neuronx-cc will overflow "
+                "its ~5M instruction limit (NCC_EVRF007).  The batched path "
+                "has no sharded variant — use compile_dslash_eo (halves V), "
+                "or compile_dslash_sharded (single-RHS) in a host-side loop "
+                "over right-hand sides."
+            )
+
         if isinstance(dslash_module, WilsonDirac):
             diag = 4.0 + dslash_module.mass
         else:
