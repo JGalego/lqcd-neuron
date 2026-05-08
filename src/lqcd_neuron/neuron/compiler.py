@@ -1187,11 +1187,17 @@ class _ShardedDslashWrapper(nn.Module):
 #   V = 1,048,576 (32^4)              → 33.78M HLO  (~32.2 insn/site)
 #   V =   262,144 (8×32×32×32 shard)  →  8.44M HLO  (~32.2 insn/site)
 #
-# We use 150,000 — slightly under the budget — for headroom against the
-# "typical limit" wording in NCC_EVRF007 and against the small overhead
-# of the halo cat splices.  Used to auto-pick num_shards when callers
-# don't specify.
-_DEFAULT_SHARD_VOLUME_CAP = 150_000
+# We deliberately stay well under the nominal 156k ceiling: at
+# --optlevel=2 (our default), CSE / strength-reduction passes inflate
+# the per-site instruction count, and graphs that fit at optlevel=1
+# can still trip neuronx-cc exit code 70 ("instruction count exceeds
+# typical limit") at higher optimisation levels.  Empirically V=82,944
+# (24^4 split into N=4 slabs) hits this cliff, so we pick 80,000 to
+# auto-route 24^4 to N=8 and 32^4 to N=16.  Override via
+# ``compile_dslash_sharded(..., num_shards=N)`` for finer control;
+# ``compile_dslash_sharded`` will also auto-retry with progressively
+# more shards if a per-shard NEFF fails to compile.
+_DEFAULT_SHARD_VOLUME_CAP = 80_000
 
 
 def _auto_num_shards(lattice_shape: Tuple[int, int, int, int]) -> int:
@@ -1393,6 +1399,7 @@ class NeuronCompiler:
         ns: int = 4,
         gauge_field: Optional[torch.Tensor] = None,
         fused: bool = True,
+        num_shards: Optional[int] = None,
     ) -> nn.Module:
         """Compile a Dslash / Dirac operator for a fixed lattice shape.
 
@@ -1425,6 +1432,14 @@ class NeuronCompiler:
                            large lattices where the fused kernels overflow
                            NeuronCore on-chip memory.  Ignored when
                            *gauge_field* is *None*.
+            num_shards:    Optional explicit T-axis shard count.  Forces
+                           the sharded compile path even when the lattice
+                           fits the single-NEFF budget.  When *None*
+                           (default), sharding is auto-selected based on
+                           ``_DEFAULT_SHARD_VOLUME_CAP`` (and
+                           ``compile_dslash_sharded`` will further auto-
+                           refine if a per-shard NEFF still fails to
+                           compile).
 
         Returns:
             Module with ``forward(psi, U)`` accepting ``complex64`` tensors.
@@ -1481,6 +1496,26 @@ class NeuronCompiler:
             sharded_fallback = False
             fused_kernel_mib: Optional[float] = None
             sram_budget_mib: Optional[float] = None
+
+            # Honour an explicit num_shards request up-front: skip the
+            # fused/unfused single-NEFF attempts entirely and go straight
+            # to the sharded path.  This lets callers preempt the cap
+            # heuristic when they know a finer split is needed.
+            if num_shards is not None:
+                logger.info(
+                    "compile_dslash: explicit num_shards=%d requested — "
+                    "routing through compile_dslash_sharded.",
+                    num_shards,
+                )
+                sharded = self.compile_dslash_sharded(
+                    dslash_module, lattice_shape, gauge_field,
+                    num_shards=num_shards, nc=nc, ns=ns,
+                )
+                return _attach_compile_info(
+                    sharded,
+                    sharded_fallback=False,
+                    fused_fallback=False,
+                )
 
             # Auto-fallback: if the fused per-site (Ns×Nc)² kernels would
             # overflow NeuronCore SRAM, use the unfused baked-gauge path
@@ -1948,32 +1983,75 @@ class NeuronCompiler:
         dt = self.torch_dtype
         cpu = torch.device("cpu")
 
-        logger.info(
-            "compile_dslash_sharded: V=%d sharded along T into %d slabs of "
-            "T_local=%d (V_local=%d).  Compiling %d separate NEFFs …",
-            T * Z * Y * X, num_shards, T_local, T_local * Z * Y * X, num_shards,
-        )
+        # Auto-retry policy.  neuronx-cc occasionally fails with exit
+        # code 70 ("instructions generated exceeds typical limit") for
+        # per-shard graphs that are nominally under the budget but trip
+        # CSE/strength-reduction passes at higher --optlevel.  Rather
+        # than surface a hard error, halve T_local (double num_shards)
+        # and retry, up to T (one row per slab).
+        max_retries = 0
+        n = num_shards
+        while n < T:
+            n *= 2
+            max_retries += 1
+        retries_done = 0
+        sharded_retry = False
+        initial_num_shards = num_shards
 
-        shard_modules = []
-        for s in range(num_shards):
-            U_l_re, U_l_im, U_tm1_re, U_tm1_im = _slice_shard_gauge(
-                gauge_field, s, num_shards, dtype=dt,
+        while True:
+            logger.info(
+                "compile_dslash_sharded: V=%d sharded along T into %d slabs of "
+                "T_local=%d (V_local=%d).  Compiling %d separate NEFFs …",
+                T * Z * Y * X, num_shards, T_local,
+                T_local * Z * Y * X, num_shards,
             )
-            adapter = _ShardedBakedGaugeAdapter(
-                U_l_re, U_l_im, U_tm1_re, U_tm1_im,
-                diag=diag, nc=nc,
-            ).to(dt)
-            psi_re = torch.zeros(T_local, Z, Y, X, ns, nc, dtype=dt, device=cpu)
-            psi_im = torch.zeros_like(psi_re)
-            hl_re  = torch.zeros(1, Z, Y, X, ns, nc, dtype=dt, device=cpu)
-            hl_im  = torch.zeros_like(hl_re)
-            hr_re  = torch.zeros_like(hl_re)
-            hr_im  = torch.zeros_like(hl_re)
-            # Per-shard NEFF embeds shard-specific baked U; no cache key.
-            compiled = self.compile(
-                adapter, (psi_re, psi_im, hl_re, hl_im, hr_re, hr_im)
-            )
-            shard_modules.append(compiled)
+
+            shard_modules = []
+            try:
+                for s in range(num_shards):
+                    U_l_re, U_l_im, U_tm1_re, U_tm1_im = _slice_shard_gauge(
+                        gauge_field, s, num_shards, dtype=dt,
+                    )
+                    adapter = _ShardedBakedGaugeAdapter(
+                        U_l_re, U_l_im, U_tm1_re, U_tm1_im,
+                        diag=diag, nc=nc,
+                    ).to(dt)
+                    psi_re = torch.zeros(
+                        T_local, Z, Y, X, ns, nc, dtype=dt, device=cpu,
+                    )
+                    psi_im = torch.zeros_like(psi_re)
+                    hl_re = torch.zeros(1, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+                    hl_im = torch.zeros_like(hl_re)
+                    hr_re = torch.zeros_like(hl_re)
+                    hr_im = torch.zeros_like(hl_re)
+                    # Per-shard NEFF embeds shard-specific baked U; no cache key.
+                    compiled = self.compile(
+                        adapter, (psi_re, psi_im, hl_re, hl_im, hr_re, hr_im)
+                    )
+                    shard_modules.append(compiled)
+                break  # all shards compiled successfully
+            except RuntimeError as exc:
+                # Try doubling num_shards (halving T_local) on any
+                # neuronx-cc compile failure, up to T slabs.  If we've
+                # already exhausted retries, propagate the original
+                # error so the caller sees the real diagnostic.
+                if retries_done >= max_retries:
+                    raise
+                next_n = num_shards * 2
+                # Pick the next divisor of T that is ≥ next_n.
+                while next_n <= T and T % next_n != 0:
+                    next_n += 1
+                if next_n > T:
+                    raise
+                logger.warning(
+                    "compile_dslash_sharded: per-shard compile failed at "
+                    "num_shards=%d (T_local=%d) — %s.  Retrying with "
+                    "num_shards=%d (T_local=%d).",
+                    num_shards, T_local, exc, next_n, T // next_n,
+                )
+                T_local, num_shards = _shard_T_indices(T, next_n)
+                retries_done += 1
+                sharded_retry = True
 
         return _attach_compile_info(
             _ShardedDslashWrapper(
@@ -1986,6 +2064,8 @@ class NeuronCompiler:
             lattice_shape=tuple(lattice_shape),
             fused_fallback=False,
             sharded_fallback=False,
+            sharded_retry=sharded_retry,
+            initial_num_shards=int(initial_num_shards),
             num_shards=int(num_shards),
             T_local=int(T_local),
             batch_size=1,

@@ -101,10 +101,11 @@ def test_sharded_rejects_non_divisible_T():
     "shape,expected",
     [
         ((4, 4, 4, 4), 1),         # V=256 well below cap
-        ((16, 16, 16, 16), 1),     # V=65,536 below cap → no shard needed
-        ((24, 24, 24, 24), 4),     # V=331,776 → V_local=82,944 at n=4
-        ((32, 32, 32, 32), 8),     # V=1,048,576 → V_local=131,072 at n=8
-        ((48, 32, 32, 32), 16),    # V=2,359,296 → V_local=147,456 at n=16
+        ((16, 16, 16, 16), 1),     # V=65,536 below 80k cap → no shard needed
+        ((24, 24, 24, 24), 8),     # V=331,776 → V_local=41,472 at n=8
+        ((32, 32, 32, 32), 16),    # V=1,048,576 → V_local=65,536 at n=16
+        ((48, 32, 32, 32), 24),    # V=2,359,296; T=48 not divisible by 32, falls
+                                   # back to largest divisor ≤32 → 24 (V_local=98,304)
     ],
 )
 def test_auto_num_shards(shape, expected):
