@@ -530,6 +530,27 @@ class _FusedBatchedDslashWrapper(nn.Module):
         return torch.complex(r_re.float(), r_im.float())
 
 
+class _HostLoopBatchedWrapper(nn.Module):
+    """Fallback batched shim that loops a single-RHS module over the batch dim.
+
+    Used by ``compile_dslash_batched`` when the fused multi-RHS NEFF would
+    overflow NeuronCore SRAM or the per-NEFF HLO instruction budget.  The
+    wrapped *single_rhs_module* is the output of ``compile_dslash`` (with
+    its own auto fused→unfused→sharded fallbacks), so this preserves the
+    batched API at the cost of dispatch-overhead amortisation.
+    """
+
+    def __init__(self, single_rhs_module: nn.Module) -> None:
+        super().__init__()
+        self._m = single_rhs_module
+
+    @torch.inference_mode()
+    def forward(self, psi: torch.Tensor) -> torch.Tensor:
+        # psi: (B, T, Z, Y, X, Ns, Nc) complex.  The inner module bakes U.
+        outs = [self._m(psi[b]) for b in range(psi.shape[0])]
+        return torch.stack(outs, dim=0)
+
+
 class _MultiCoreDslashWrapper(nn.Module):
     """Host-side shim for multi-core data-parallel Dslash execution.
 
@@ -1684,34 +1705,53 @@ class NeuronCompiler:
         dt = self.torch_dtype
         cpu = torch.device("cpu")
 
-        # Guard rails — the batched path has no unfused or sharded fallback
-        # of its own, so fail fast with an actionable message instead of
-        # spending a long compile only to die in neuronx-cc.
+        # Guard rails — when the fused multi-RHS NEFF would overflow SRAM
+        # or the per-NEFF HLO instruction budget, fall back to a host-side
+        # loop over a single-RHS compile_dslash (which has its own auto
+        # fused→unfused→sharded fallbacks).  This preserves the batched
+        # API at the cost of per-RHS dispatch overhead.
         V = T * Z * Y * X
         sram_budget = (
             self.sram_threshold_bytes
             or int(_NC2_SRAM_BYTES * _FUSED_SRAM_BUDGET)
         )
         kb = _fused_kernel_bytes(lattice_shape, ns=ns, nc=nc, dtype=dt)
+        needs_host_loop_reason: Optional[str] = None
         if kb > sram_budget:
-            raise RuntimeError(
-                f"compile_dslash_batched: fused kernels "
-                f"({kb / 1024**2:.1f} MiB) exceed SRAM budget "
-                f"({sram_budget / 1024**2:.1f} MiB) for lattice "
-                f"{lattice_shape}.  The batched path has no unfused "
-                "fallback — try compile_dslash_eo (halves V), reduce the "
-                "lattice, or call compile_dslash (single-RHS, with auto "
-                "fallbacks) in a host-side loop."
+            needs_host_loop_reason = (
+                f"fused kernels ({kb / 1024**2:.1f} MiB) exceed SRAM budget "
+                f"({sram_budget / 1024**2:.1f} MiB)"
             )
-        if V > _DEFAULT_SHARD_VOLUME_CAP:
-            raise RuntimeError(
-                f"compile_dslash_batched: V={V} exceeds per-NEFF HLO "
-                f"instruction budget (cap={_DEFAULT_SHARD_VOLUME_CAP} sites) "
-                f"for lattice {lattice_shape}.  neuronx-cc will overflow "
-                "its ~5M instruction limit (NCC_EVRF007).  The batched path "
-                "has no sharded variant — use compile_dslash_eo (halves V), "
-                "or compile_dslash_sharded (single-RHS) in a host-side loop "
-                "over right-hand sides."
+        elif V > _DEFAULT_SHARD_VOLUME_CAP:
+            needs_host_loop_reason = (
+                f"V={V} exceeds per-NEFF HLO instruction budget "
+                f"(cap={_DEFAULT_SHARD_VOLUME_CAP} sites)"
+            )
+
+        if needs_host_loop_reason is not None:
+            logger.warning(
+                "compile_dslash_batched: %s for lattice %s — falling back "
+                "to a host-side loop over compile_dslash (single-RHS, with "
+                "auto fused→unfused→sharded fallbacks).  Per-RHS dispatch "
+                "overhead is no longer amortised across the batch.",
+                needs_host_loop_reason, lattice_shape,
+            )
+            single = self.compile_dslash(
+                dslash_module, lattice_shape, nc=nc, ns=ns,
+                gauge_field=gauge_field, fused=True,
+            )
+            single_info = getattr(single, "lqcd_compile_info", {}) or {}
+            return _attach_compile_info(
+                _HostLoopBatchedWrapper(single),
+                kernel=single_info.get("kernel", "host_loop"),
+                lattice_shape=tuple(lattice_shape),
+                fused_fallback=bool(single_info.get("fused_fallback", False)),
+                sharded_fallback=bool(single_info.get("sharded_fallback", False)),
+                num_shards=int(single_info.get("num_shards", 1)),
+                T_local=int(single_info.get("T_local", T)),
+                batch_size=int(batch_size),
+                num_cores=1,
+                batched_host_loop=True,
             )
 
         if isinstance(dslash_module, WilsonDirac):
