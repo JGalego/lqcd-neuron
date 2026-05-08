@@ -140,45 +140,45 @@ typecheck:  ## Run mypy
 INFRA_DIR := infra
 
 .PHONY: tofu-init
-tofu-init:  ## Initialise OpenTofu (download providers)
+tofu-init: _check-aws  ## Initialise OpenTofu (download providers)
 	tofu -chdir=$(INFRA_DIR) init
 
 .PHONY: tofu-plan
-tofu-plan:  ## Show what OpenTofu will create
+tofu-plan: _check-aws  ## Show what OpenTofu will create
 	tofu -chdir=$(INFRA_DIR) plan
 
 .PHONY: tofu-apply
-tofu-apply:  ## Provision the Inf2 instance
+tofu-apply: _check-aws  ## Provision the Inf2 instance
 	tofu -chdir=$(INFRA_DIR) apply
 
 .PHONY: tofu-apply-auto
-tofu-apply-auto:  ## Provision without interactive confirmation (CI use)
+tofu-apply-auto: _check-aws  ## Provision without interactive confirmation (CI use)
 	tofu -chdir=$(INFRA_DIR) apply -auto-approve
 
 .PHONY: tofu-destroy
-tofu-destroy:  ## Destroy the instance and all infra (prompts for confirmation)
+tofu-destroy: _check-aws  ## Destroy the instance and all infra (prompts for confirmation)
 	tofu -chdir=$(INFRA_DIR) destroy
 
 .PHONY: tofu-output
-tofu-output:  ## Print instance connection details
+tofu-output: _check-aws  ## Print instance connection details
 	tofu -chdir=$(INFRA_DIR) output
 
 .PHONY: connect
-connect:  ## Open an SSH shell on the provisioned instance
+connect: _check-aws  ## Open an SSH shell on the provisioned instance
 	bash scripts/connect_inf2.sh
 
 .PHONY: connect-setup
-connect-setup:  ## Bootstrap the instance, then open a shell
+connect-setup: _check-aws  ## Bootstrap the instance, then open a shell
 	chmod +x scripts/connect_inf2.sh
 	bash scripts/connect_inf2.sh --setup
 
 .PHONY: connect-test
-connect-test:  ## Run tests on the instance
+connect-test: _check-aws  ## Run tests on the instance
 	chmod +x scripts/connect_inf2.sh
 	bash scripts/connect_inf2.sh --test
 
 .PHONY: connect-bench
-connect-bench:  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTICE=...] [BATCH=...]
+connect-bench: _check-aws  ## Run benchmarks on the instance [NEURON=1] [NO_FUSED=1] [LATTICE=...] [BATCH=...]
 	chmod +x scripts/connect_inf2.sh
 	bash scripts/connect_inf2.sh --bench $(if $(filter 1,$(NEURON)),--neuron) $(if $(filter 1,$(NO_FUSED)),--no-fused) $(foreach l,$(LATTICE),--lattice $(l)) $(if $(BATCH),--batch-sizes $(BATCH))
 
@@ -216,7 +216,7 @@ _JOB_FLAGS += $(if $(BATCH),--batch-sizes $(BATCH))
 _JOB_FLAGS += $(if $(OPTLEVEL),--optlevel $(OPTLEVEL))
 
 .PHONY: bench-job
-bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral] [WAIT=1] [WALLCLOCK=min]
+bench-job: _check-aws  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral] [WAIT=1] [WALLCLOCK=min]
 	chmod +x scripts/trigger_bench_job.sh
 	bash scripts/trigger_bench_job.sh \
 	    --mode $(MODE) \
@@ -234,6 +234,45 @@ bench-job:  ## Trigger a bench job (results emailed) [MODE=persistent|ephemeral]
 # ---------------------------------------------------------------------------
 _BENCH_BUCKET = $$(tofu -chdir=$(INFRA_DIR) output -raw bench_s3_bucket)
 _BENCH_REGION = $$(tofu -chdir=$(INFRA_DIR) output -raw aws_region)
+
+# ---------------------------------------------------------------------------
+# AWS credentials precheck — emit a friendly login hint before any aws/tofu
+# command rather than letting the underlying CLI print a wall of stack trace.
+# Recipes invoke this via `$(_CHECK_AWS)` so failure short-circuits before
+# any other output (e.g. `make bench-runs` would otherwise print headers
+# while sts call hangs on an expired token).
+# ---------------------------------------------------------------------------
+define _CHECK_AWS_SH
+if ! command -v aws >/dev/null 2>&1; then
+    echo "ERROR: 'aws' CLI not found in PATH." >&2
+    echo "       Install it: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" >&2
+    exit 2
+fi
+if aws sts get-caller-identity >/dev/null 2>&1; then
+    exit 0
+fi
+profile=$${AWS_PROFILE:-default}
+echo "ERROR: no valid AWS credentials for profile '$$profile'." >&2
+# Probe the profile's config to pick the most relevant login hint.
+sso_session=$$(aws configure get sso_session --profile "$$profile" 2>/dev/null || true)
+sso_start=$$(aws configure get sso_start_url --profile "$$profile" 2>/dev/null || true)
+if [ -n "$$sso_session" ] || [ -n "$$sso_start" ]; then
+    echo "       Run: aws sso login --profile $$profile" >&2
+else
+    echo "       Try one of:" >&2
+    echo "         aws login --profile $$profile            # browser-based console login (CLI v2)" >&2
+    echo "         aws sso login --profile <sso-profile>    # for an IAM Identity Center profile" >&2
+    echo "         aws configure --profile $$profile        # set static access keys" >&2
+    echo "         export AWS_PROFILE=<other-profile>" >&2
+fi
+exit 2
+endef
+export _CHECK_AWS_SH
+_CHECK_AWS = bash -c "$$_CHECK_AWS_SH"
+
+.PHONY: _check-aws
+_check-aws:
+	@$(_CHECK_AWS)
 
 # Classify a run from its S3 artefacts (and a single EC2 cross-check):
 #   DONE OK / DONE FAILED / DONE ?  -- final bench.log present
@@ -408,7 +447,7 @@ endef
 export _BENCH_RUNS_PY
 
 .PHONY: bench-runs
-bench-runs:  ## List bench runs in S3 [STALE_MIN=30]
+bench-runs: _check-aws  ## List bench runs in S3 [STALE_MIN=30]
 	@_BENCH_REGION=$(_BENCH_REGION) _BENCH_BUCKET=$(_BENCH_BUCKET) \
 	 STALE_MIN=$(or $(STALE_MIN),30) \
 	 aws s3api list-objects-v2 --region $(_BENCH_REGION) \
@@ -557,7 +596,7 @@ endef
 export _BENCH_AVG_PY
 
 .PHONY: bench-tail
-bench-tail:  ## Tail partial results [no RUN: avg across all runs] [RUN=<id>] [RAW=1] [LOG=1]
+bench-tail: _check-aws  ## Tail partial results [no RUN: avg across all runs] [RUN=<id>] [RAW=1] [LOG=1]
 	@if [ "$(LOG)" = "1" ] && [ -z "$(RUN)" ]; then \
 	    echo "LOG=1 requires RUN=<run_id>"; exit 2; \
 	fi
@@ -598,7 +637,7 @@ bench-tail:  ## Tail partial results [no RUN: avg across all runs] [RUN=<id>] [R
 	fi
 
 .PHONY: bench-rm
-bench-rm:  ## Delete a bench run from S3 (RUN=<id> [YES=1] to skip prompt)
+bench-rm: _check-aws  ## Delete a bench run from S3 (RUN=<id> [YES=1] to skip prompt)
 	@if [ -z "$(RUN)" ]; then \
 	    echo "Usage: make bench-rm RUN=<run_id> [YES=1]"; exit 2; \
 	fi
