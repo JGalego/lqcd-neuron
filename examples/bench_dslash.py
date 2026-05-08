@@ -89,6 +89,38 @@ def _compile_info(module) -> dict:
     return dict(getattr(module, "lqcd_compile_info", {}) or {})
 
 
+def _info_compromises(info: dict) -> List[str]:
+    """Return human-readable tags for each fallback the compiler took.
+
+    Surfaces every time NeuronCompiler had to deviate from the requested
+    path — e.g. fused→unfused on SRAM overflow, →sharded on HLO-budget
+    overflow, or →host-loop on the batched path.  These are the same
+    fallbacks normally hinted at by the trailing ``*`` in the Mode column.
+    """
+    tags: List[str] = []
+    if not info:
+        return tags
+    if info.get("fused_fallback"):
+        tags.append("fused→unfused")
+    if info.get("sharded_fallback"):
+        tags.append(f"→sharded(N={info.get('num_shards', '?')})")
+    if info.get("batched_host_loop"):
+        tags.append("batched→host-loop")
+    return tags
+
+
+def _entry_compile_notes(entry: dict) -> str:
+    """Compose a per-row compile-compromise note from the *_info dicts."""
+    parts: List[str] = []
+    for prefix, key in (("N", "neuron_info"),
+                        ("B", "batched_info"),
+                        ("M", "multicore_info")):
+        tags = _info_compromises(entry.get(key) or {})
+        if tags:
+            parts.append(f"{prefix}:" + "+".join(tags))
+    return " ".join(parts)
+
+
 def _fmt_mode(info: dict) -> str:
     """Render a compact one-token tag for the table 'Mode' column.
 
@@ -236,6 +268,10 @@ def _emit_partial(entry: dict) -> None:
                 e[k] = v
         # add wallclock so consumers can see when each lattice landed
         e["t_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # synthesise a one-line compile-compromise note for `make bench-tail`
+        notes = _entry_compile_notes(e)
+        if notes:
+            e["compile_notes"] = notes
         with open(jsonl_path, "a") as f:
             f.write(json.dumps(e) + "\n")
     except OSError:

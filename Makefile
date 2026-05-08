@@ -459,7 +459,12 @@ cols = [
     ("batched",   "Batched",    lambda r: _fmt(_num(r, "batched"))),
     ("multicore", "Multicore",  lambda r: _fmt(_num(r, "multicore"))),
     ("speedup",   "Speedup",    _speedup),
-    ("note",      "note",       lambda r: r.get("skipped") or r.get("neuron_error") or r.get("batched_error") or ""),
+    ("note",      "note",       lambda r: " | ".join(s for s in (
+                                    r.get("skipped"),
+                                    r.get("neuron_error"),
+                                    r.get("batched_error"),
+                                    r.get("compile_notes"),
+                                ) if s)),
 ]
 data = [[fn(r) for _, _, fn in cols] for r in rows]
 # Drop columns that are empty for every row (e.g. t_utc in averaged mode).
@@ -515,10 +520,14 @@ for line in sys.stdin:
         "_n":   collections.defaultdict(int),
         "_runs": set(),
         "_count": 0,
+        "_notes": set(),
     })
     g["_count"] += 1
     if run_id:
         g["_runs"].add(run_id)
+    cn = r.get("compile_notes")
+    if cn:
+        g["_notes"].add(cn)
     for k in THROUGHPUT_KEYS:
         v = r.get(k)
         if isinstance(v, (int, float)):
@@ -541,6 +550,8 @@ for key in sorted(groups, key=lambda k: (_vol(k[0]), k[1] if isinstance(k[1], in
         if g["_n"][k]:
             out[k] = g["_sum"][k] / g["_n"][k]
     out["note"] = ", ".join(sorted(g["_runs"])) if g["_runs"] else f"avg(n={g['_count']})"
+    if g["_notes"]:
+        out["compile_notes"] = " ; ".join(sorted(g["_notes"]))
     print(json.dumps(out))
 endef
 export _BENCH_AVG_PY
