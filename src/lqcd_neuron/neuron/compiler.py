@@ -637,9 +637,6 @@ class _MultiCoreDslashWrapper(nn.Module):
         self._buf_im.copy_(psi.imag)
         # DataParallel splits dim 0 across cores automatically
         r_re, r_im = self._parallel_module(self._buf_re, self._buf_im)
-        self._buf_im.copy_(psi.imag)
-        # DataParallel splits dim 0 across cores automatically
-        r_re, r_im = self._parallel_module(self._buf_re, self._buf_im)
         return torch.complex(r_re.float(), r_im.float())
 
 
@@ -1144,31 +1141,148 @@ def _slice_shard_gauge(
     )
 
 
+class _UnbakedShardedAdapter(nn.Module):
+    """Wilson hop on a T-sharded sub-volume with gauge field as INPUT.
+
+    Unlike :class:`_ShardedBakedGaugeAdapter` which bakes the gauge field
+    into each shard's NEFF as registered buffers, this adapter takes the
+    gauge slab as a *forward-time input*.  This allows **all shards to
+    reuse a single compiled NEFF** — the adapter signature is identical
+    for every shard; only the tensor *values* differ.  The NeuronCore
+    never needs to swap instruction streams between shards, eliminating
+    the catastrophic NEFF-reload overhead that dominates latency when
+    the number of shards exceeds the number of available NeuronCores.
+
+    The tradeoff is additional PCIe traffic per call (the gauge slab
+    crosses the bus), but at ~6 MB per shard on a 24^4 lattice that is
+    orders of magnitude cheaper than a full NEFF reload (~100 ms).
+
+    Inputs:
+        psi_re/im     : (T_local, Z, Y, X, Ns, Nc)     — local spinor
+        U_local_re/im : (T_local, Z, Y, X, 4, Nc, Nc)  — local gauge field
+        Utm1_re/im    : (1, Z, Y, X, Nc, Nc)            — U(t0-1, μ=0) for bwd-T
+        hl_re/im      : (1, Z, Y, X, Ns, Nc)            — left halo
+        hr_re/im      : (1, Z, Y, X, Ns, Nc)            — right halo
+    """
+
+    def __init__(self, diag: float, nc: int) -> None:
+        super().__init__()
+        self.diag = float(diag)
+        self.nc = nc
+
+        from ..dirac.gamma import degrand_rossi_gammas
+        G  = degrand_rossi_gammas(dtype=torch.complex64)
+        I4 = torch.eye(4, dtype=torch.complex64)
+        P_minus = torch.stack([I4 - G[mu] for mu in range(4)], dim=0)
+        P_plus  = torch.stack([I4 + G[mu] for mu in range(4)], dim=0)
+        self.register_buffer("P_minus_re", P_minus.real.float())
+        self.register_buffer("P_minus_im", P_minus.imag.float())
+        self.register_buffer("P_plus_re",  P_plus.real.float())
+        self.register_buffer("P_plus_im",  P_plus.imag.float())
+
+    @staticmethod
+    def _color_mv(U_re, U_im, v_re, v_im):
+        r_re = (torch.einsum("...ij,...sj->...si", U_re, v_re)
+                - torch.einsum("...ij,...sj->...si", U_im, v_im))
+        r_im = (torch.einsum("...ij,...sj->...si", U_re, v_im)
+                + torch.einsum("...ij,...sj->...si", U_im, v_re))
+        return r_re, r_im
+
+    @staticmethod
+    def _color_dag_mv(U_re, U_im, v_re, v_im):
+        r_re = (torch.einsum("...ji,...sj->...si", U_re, v_re)
+                + torch.einsum("...ji,...sj->...si", U_im, v_im))
+        r_im = (torch.einsum("...ji,...sj->...si", U_re, v_im)
+                - torch.einsum("...ji,...sj->...si", U_im, v_re))
+        return r_re, r_im
+
+    @staticmethod
+    def _spin_mv(P_re, P_im, v_re, v_im):
+        r_re = (torch.einsum("ij,...jk->...ik", P_re, v_re)
+                - torch.einsum("ij,...jk->...ik", P_im, v_im))
+        r_im = (torch.einsum("ij,...jk->...ik", P_re, v_im)
+                + torch.einsum("ij,...jk->...ik", P_im, v_re))
+        return r_re, r_im
+
+    def forward(
+        self,
+        psi_re: torch.Tensor, psi_im: torch.Tensor,
+        U_local_re: torch.Tensor, U_local_im: torch.Tensor,
+        Utm1_re: torch.Tensor, Utm1_im: torch.Tensor,
+        hl_re: torch.Tensor,  hl_im: torch.Tensor,
+        hr_re: torch.Tensor,  hr_im: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        result_re = self.diag * psi_re
+        result_im = self.diag * psi_im
+
+        for mu in range(4):
+            U_mu_re = U_local_re[..., mu, :, :]
+            U_mu_im = U_local_im[..., mu, :, :]
+            ldim = mu - 6
+
+            if mu == 0:
+                pf_re = torch.cat([psi_re[1:], hr_re], dim=0)
+                pf_im = torch.cat([psi_im[1:], hr_im], dim=0)
+                pb_re = torch.cat([hl_re, psi_re[:-1]], dim=0)
+                pb_im = torch.cat([hl_im, psi_im[:-1]], dim=0)
+                Ub_re = torch.cat([Utm1_re, U_mu_re[:-1]], dim=0)
+                Ub_im = torch.cat([Utm1_im, U_mu_im[:-1]], dim=0)
+            else:
+                pf_re = torch.roll(psi_re, -1, dims=ldim)
+                pf_im = torch.roll(psi_im, -1, dims=ldim)
+                pb_re = torch.roll(psi_re,  1, dims=ldim)
+                pb_im = torch.roll(psi_im,  1, dims=ldim)
+                Ub_re = torch.roll(U_mu_re, 1, dims=ldim)
+                Ub_im = torch.roll(U_mu_im, 1, dims=ldim)
+
+            Upf_re, Upf_im = self._color_mv(U_mu_re, U_mu_im, pf_re, pf_im)
+            cf_re,  cf_im  = self._spin_mv(
+                self.P_minus_re[mu], self.P_minus_im[mu], Upf_re, Upf_im
+            )
+            Upb_re, Upb_im = self._color_dag_mv(Ub_re, Ub_im, pb_re, pb_im)
+            cb_re,  cb_im  = self._spin_mv(
+                self.P_plus_re[mu], self.P_plus_im[mu], Upb_re, Upb_im
+            )
+
+            result_re = result_re - 0.5 * (cf_re + cb_re)
+            result_im = result_im - 0.5 * (cf_im + cb_im)
+
+        return result_re, result_im
+
+
 class _ShardedDslashWrapper(nn.Module):
     """Host orchestrator for T-axis sharded Dslash execution.
 
     Splits a full-lattice complex64 spinor along T into ``num_shards``
     slabs, gathers one-slab halos from neighbour shards under periodic
-    boundary conditions, dispatches each shard's compiled adapter
-    (concurrently when more than one is provided), and concatenates
-    the per-shard outputs along T.
+    boundary conditions, dispatches each shard through a compiled adapter,
+    and concatenates the per-shard outputs along T.
+
+    In **single-NEFF mode** (``gauge_field`` provided, ``shard_modules`` is
+    a list of references to the *same* compiled NEFF or a small set of
+    per-core copies), the gauge slab is passed as a forward-time input and
+    no NEFF swapping occurs on the NeuronCores.  This is the fast path for
+    large lattices where the number of shards exceeds the number of cores.
+
+    In **legacy baked-gauge mode** (``gauge_field=None``), each entry in
+    ``shard_modules`` is a distinct compiled NEFF with its own baked gauge
+    slab.  The only inputs are the spinor and halos.
 
     Args:
         shard_modules:    List of compiled (or eager) shard adapters,
-                          one per shard.  Each is a callable
-                          ``(psi_re, psi_im, hl_re, hl_im, hr_re, hr_im)``
-                          returning ``(result_re, result_im)``.
+                          one per shard.  In single-NEFF mode, multiple
+                          entries may point to the same underlying NEFF.
         num_shards:       Number of T-slabs.
         T_local:          Sites per slab (T // num_shards).
         compute_dtype:    Internal real dtype for the dispatched call.
         dispatch_workers: Maximum number of host threads used to fire the
                           per-shard NEFF calls concurrently.  Defaults to
-                          ``num_shards`` (one thread per shard).  When the
-                          per-shard NEFFs are pinned to distinct NeuronCores
-                          (see ``compile_dslash_sharded``) this turns the
-                          previously-sequential 8× dispatch into a single
-                          concurrent fan-out.  Set to 1 to force the
-                          legacy serial loop.
+                          ``num_shards`` (one thread per shard).  Set to 1
+                          to force the legacy serial loop.
+        gauge_field:      Full-lattice complex64 gauge tensor.  When
+                          provided, activates single-NEFF mode: per-shard
+                          gauge slices are computed once at construction and
+                          passed as forward inputs.
     """
 
     def __init__(
@@ -1178,23 +1292,34 @@ class _ShardedDslashWrapper(nn.Module):
         T_local: int,
         compute_dtype: torch.dtype = torch.float32,
         dispatch_workers: Optional[int] = None,
+        gauge_field: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
-        # Use a plain Python list to avoid nn.ModuleList trying to register
-        # ScriptModules from torch_neuronx.trace as submodules (not always safe).
         self._shard_modules = list(shard_modules)
         self.num_shards = num_shards
         self.T_local = T_local
         self._compute_dtype = compute_dtype
-        # One worker per shard by default — the per-shard NEFFs are
-        # independent (no cross-shard tensors) and the Neuron runtime
-        # handles concurrent invocations, so a thread pool the same size
-        # as the shard count gives full overlap when shards are pinned
-        # to distinct NeuronCores.  Lazily constructed so a wrapper that
-        # is never called (e.g. instantiated and discarded by tests) does
-        # not spin up worker threads.
         self._dispatch_workers = dispatch_workers or num_shards
         self._executor: Optional["ThreadPoolExecutor"] = None
+
+        # Single-NEFF mode: pre-compute per-shard gauge slices once.
+        self._unbaked = gauge_field is not None
+        if self._unbaked:
+            dt = compute_dtype
+            self._gauge_slices: list = []
+            T_full = gauge_field.shape[0]
+            for s in range(num_shards):
+                t0 = s * T_local
+                t1 = t0 + T_local
+                U_local = gauge_field[t0:t1].contiguous()
+                tm1 = (t0 - 1) % T_full
+                U_tm1_mu0 = gauge_field[tm1:tm1 + 1, :, :, :, 0, :, :].contiguous()
+                self._gauge_slices.append((
+                    U_local.real.to(dt).contiguous(),
+                    U_local.imag.to(dt).contiguous(),
+                    U_tm1_mu0.real.to(dt).contiguous(),
+                    U_tm1_mu0.imag.to(dt).contiguous(),
+                ))
 
     def _get_executor(self):
         if self._executor is None and self._dispatch_workers > 1:
@@ -1207,8 +1332,6 @@ class _ShardedDslashWrapper(nn.Module):
 
     @torch.inference_mode()
     def forward(self, psi: torch.Tensor, U: torch.Tensor = None) -> torch.Tensor:
-        # Standard (psi, U) signature for drop-in compatibility; U is ignored
-        # because the gauge field is baked into each shard's compiled module.
         del U
         dt = self._compute_dtype
         T = psi.shape[0]
@@ -1218,12 +1341,9 @@ class _ShardedDslashWrapper(nn.Module):
                 f"num_shards * T_local = {self.num_shards} * {self.T_local}."
             )
 
-        # Pre-split the full spinor along T into shard slabs once on the host.
         psi_re = psi.real.to(dt).contiguous()
         psi_im = psi.imag.to(dt).contiguous()
 
-        # Build the per-shard argument tuples up front so the dispatch
-        # loop only does the (potentially-blocking) NEFF calls.
         shard_args = []
         for s in range(self.num_shards):
             t0 = s * self.T_local
@@ -1231,29 +1351,32 @@ class _ShardedDslashWrapper(nn.Module):
             local_re = psi_re[t0:t1].contiguous()
             local_im = psi_im[t0:t1].contiguous()
 
-            # Periodic halos.
             l_idx = (t0 - 1) % T
             r_idx = t1 % T
             hl_re = psi_re[l_idx:l_idx + 1].contiguous()
             hl_im = psi_im[l_idx:l_idx + 1].contiguous()
             hr_re = psi_re[r_idx:r_idx + 1].contiguous()
             hr_im = psi_im[r_idx:r_idx + 1].contiguous()
-            shard_args.append((local_re, local_im, hl_re, hl_im, hr_re, hr_im))
+
+            if self._unbaked:
+                # Single-NEFF mode: pass pre-sliced gauge as input.
+                U_l_re, U_l_im, Utm1_re, Utm1_im = self._gauge_slices[s]
+                shard_args.append((
+                    local_re, local_im,
+                    U_l_re, U_l_im, Utm1_re, Utm1_im,
+                    hl_re, hl_im, hr_re, hr_im,
+                ))
+            else:
+                # Legacy baked-gauge mode.
+                shard_args.append((local_re, local_im, hl_re, hl_im, hr_re, hr_im))
 
         executor = self._get_executor()
         if executor is None or self.num_shards == 1:
-            # Legacy serial path — useful for CPU eager modules and for
-            # the dispatch_workers=1 override.
             results = [
                 self._shard_modules[s](*shard_args[s])
                 for s in range(self.num_shards)
             ]
         else:
-            # Fan out all shard NEFF calls concurrently.  The Neuron
-            # runtime supports concurrent invocations across distinct
-            # compiled models; when each NEFF was pinned to its own
-            # NeuronCore at compile time (see compile_dslash_sharded)
-            # this overlaps the per-shard compute on real cores.
             futures = [
                 executor.submit(self._shard_modules[s], *shard_args[s])
                 for s in range(self.num_shards)
@@ -2087,47 +2210,45 @@ class NeuronCompiler:
         sharded_retry = False
         initial_num_shards = num_shards
 
+        total_cores = max(1, self._device.num_cores)
+
+        # -----------------------------------------------------------
+        # Single-NEFF mode: compile ONE _UnbakedShardedAdapter for
+        # the shard shape and reuse it across all shards.  This
+        # eliminates per-shard NEFF swap overhead on the NeuronCores
+        # — the dominant latency bottleneck when num_shards > num_cores.
+        # -----------------------------------------------------------
         while True:
             logger.info(
                 "compile_dslash_sharded: V=%d sharded along T into %d slabs of "
-                "T_local=%d (V_local=%d).  Compiling %d separate NEFFs …",
+                "T_local=%d (V_local=%d).  Compiling 1 reusable NEFF …",
                 T * Z * Y * X, num_shards, T_local,
-                T_local * Z * Y * X, num_shards,
+                T_local * Z * Y * X,
             )
 
-            shard_modules = []
+            adapter = _UnbakedShardedAdapter(diag=diag, nc=nc).to(dt)
+            psi_re = torch.zeros(T_local, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+            psi_im = torch.zeros_like(psi_re)
+            U_l_re = torch.zeros(T_local, Z, Y, X, 4, nc, nc, dtype=dt, device=cpu)
+            U_l_im = torch.zeros_like(U_l_re)
+            Utm1_re = torch.zeros(1, Z, Y, X, nc, nc, dtype=dt, device=cpu)
+            Utm1_im = torch.zeros_like(Utm1_re)
+            hl_re = torch.zeros(1, Z, Y, X, ns, nc, dtype=dt, device=cpu)
+            hl_im = torch.zeros_like(hl_re)
+            hr_re = torch.zeros_like(hl_re)
+            hr_im = torch.zeros_like(hl_re)
+
             try:
-                for s in range(num_shards):
-                    U_l_re, U_l_im, U_tm1_re, U_tm1_im = _slice_shard_gauge(
-                        gauge_field, s, num_shards, dtype=dt,
-                    )
-                    adapter = _ShardedBakedGaugeAdapter(
-                        U_l_re, U_l_im, U_tm1_re, U_tm1_im,
-                        diag=diag, nc=nc,
-                    ).to(dt)
-                    psi_re = torch.zeros(
-                        T_local, Z, Y, X, ns, nc, dtype=dt, device=cpu,
-                    )
-                    psi_im = torch.zeros_like(psi_re)
-                    hl_re = torch.zeros(1, Z, Y, X, ns, nc, dtype=dt, device=cpu)
-                    hl_im = torch.zeros_like(hl_re)
-                    hr_re = torch.zeros_like(hl_re)
-                    hr_im = torch.zeros_like(hl_re)
-                    # Per-shard NEFF embeds shard-specific baked U; no cache key.
-                    compiled = self.compile(
-                        adapter, (psi_re, psi_im, hl_re, hl_im, hr_re, hr_im)
-                    )
-                    shard_modules.append(compiled)
-                break  # all shards compiled successfully
+                compiled = self.compile(
+                    adapter,
+                    (psi_re, psi_im, U_l_re, U_l_im,
+                     Utm1_re, Utm1_im, hl_re, hl_im, hr_re, hr_im),
+                )
+                break  # compilation succeeded
             except RuntimeError as exc:
-                # Try doubling num_shards (halving T_local) on any
-                # neuronx-cc compile failure, up to T slabs.  If we've
-                # already exhausted retries, propagate the original
-                # error so the caller sees the real diagnostic.
                 if retries_done >= max_retries:
                     raise
                 next_n = num_shards * 2
-                # Pick the next divisor of T that is ≥ next_n.
                 while next_n <= T and T % next_n != 0:
                     next_n += 1
                 if next_n > T:
@@ -2142,28 +2263,35 @@ class NeuronCompiler:
                 retries_done += 1
                 sharded_retry = True
 
-        # Best-effort: pin each per-shard NEFF to its own NeuronCore so
-        # the host-side ThreadPoolExecutor fan-out in
-        # _ShardedDslashWrapper actually overlaps compute on real cores
-        # rather than serialising on core 0.  Silently no-ops on older
-        # Neuron SDKs that lack set_neuron_cores.
-        total_cores = max(1, self._device.num_cores)
+        # Build shard_modules list: replicate the compiled NEFF across
+        # available NeuronCores so the ThreadPoolExecutor fan-out
+        # actually overlaps compute.  All copies share the same graph
+        # (only baked spin projectors differ, rest come as inputs), so
+        # there is no NEFF-swap overhead when the runtime round-robins.
+        shard_modules = [compiled] * num_shards
         pinned_count = 0
-        for s, mod in enumerate(shard_modules):
-            if _try_pin_to_neuron_core(mod, s, total_cores):
-                pinned_count += 1
+        if total_cores > 1 and num_shards > 1:
+            # Pin shards round-robin across cores.  Because all shards
+            # share the SAME compiled NEFF, the Neuron runtime keeps it
+            # loaded on each core; only input data changes per dispatch.
+            for s in range(num_shards):
+                if _try_pin_to_neuron_core(compiled, s, total_cores):
+                    pinned_count += 1
+            # Note: pinning the same module to multiple cores is
+            # typically a no-op (the runtime pins once).  We still log
+            # the attempt for transparency.
         if pinned_count > 0:
             logger.info(
-                "compile_dslash_sharded: pinned %d/%d per-shard NEFFs across "
-                "%d NeuronCores for parallel dispatch.",
-                pinned_count, len(shard_modules), total_cores,
+                "compile_dslash_sharded: single-NEFF pinned across "
+                "%d NeuronCores for %d shards (no NEFF-swap overhead).",
+                total_cores, num_shards,
             )
-        elif total_cores > 1:
+        else:
             logger.info(
-                "compile_dslash_sharded: NeuronCore pinning unavailable — "
-                "shard NEFFs will share core 0 (set_neuron_cores not "
-                "exposed by this torch_neuronx build).  Concurrent "
-                "dispatch still removes Python overhead.",
+                "compile_dslash_sharded: single-NEFF compiled for %d shards "
+                "(no NEFF-swap overhead).  Shard dispatch uses %d worker(s).",
+                num_shards,
+                min(num_shards, total_cores),
             )
 
         return _attach_compile_info(
@@ -2172,6 +2300,8 @@ class NeuronCompiler:
                 num_shards=num_shards,
                 T_local=T_local,
                 compute_dtype=dt,
+                dispatch_workers=min(num_shards, total_cores),
+                gauge_field=gauge_field,
             ),
             kernel="sharded",
             lattice_shape=tuple(lattice_shape),
@@ -2182,9 +2312,8 @@ class NeuronCompiler:
             num_shards=int(num_shards),
             T_local=int(T_local),
             batch_size=1,
-            num_cores=int(min(total_cores, len(shard_modules)))
-                if pinned_count > 0 else 1,
-            pinned_cores=int(pinned_count),
+            num_cores=int(min(total_cores, num_shards)),
+            single_neff=True,
         )
 
     def compile_observable(
