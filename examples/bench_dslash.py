@@ -106,6 +106,8 @@ def _info_compromises(info: dict) -> List[str]:
         tags.append(f"→sharded(N={info.get('num_shards', '?')})")
     if info.get("batched_host_loop"):
         tags.append("batched→host-loop")
+    if info.get("multicore_host_loop"):
+        tags.append("multicore→host-loop")
     return tags
 
 

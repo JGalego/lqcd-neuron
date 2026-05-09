@@ -77,6 +77,47 @@ _NC2_SRAM_BYTES = 24 * 1024 * 1024   # 24 MiB NeuronCore-v2 SBUF
 _FUSED_SRAM_BUDGET = 0.60             # fraction of SBUF reserved for kernels
 
 
+def _try_pin_to_neuron_core(
+    compiled: nn.Module, core_id: int, total_cores: int,
+) -> bool:
+    """Best-effort pinning of *compiled* to a specific NeuronCore.
+
+    Uses ``torch_neuronx.experimental.placement.set_neuron_cores``
+    (Neuron SDK 2.x), falling back to ``torch_neuronx.set_neuron_cores``
+    if the experimental path is unavailable.  Returns ``True`` when the
+    NEFF was successfully pinned, ``False`` otherwise (older SDK, CPU-
+    only environment, or any runtime error).
+
+    The sharded Dslash wrapper uses this to spread its per-slab NEFFs
+    across distinct NeuronCores so that the host-side ``ThreadPoolExecutor``
+    fan-out actually overlaps compute on real hardware rather than
+    serialising on core 0.  The total_cores hint lets the helper wrap
+    around when there are more shards than visible cores (a benign
+    serialisation onto a subset of cores).
+    """
+    try:
+        from torch_neuronx.experimental import placement as _pl
+        set_cores = _pl.set_neuron_cores
+    except Exception:  # noqa: BLE001 — broad on purpose; multiple SDK paths
+        try:
+            import torch_neuronx as _tn
+            set_cores = getattr(_tn, "set_neuron_cores", None)
+            if set_cores is None:
+                return False
+        except Exception:
+            return False
+    try:
+        target = core_id % max(1, total_cores)
+        set_cores(compiled, start_nc=target, nc_count=1)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "set_neuron_cores(start_nc=%d) failed for shard %d/%d: %s",
+            core_id % max(1, total_cores), core_id, total_cores, exc,
+        )
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Compile-path provenance
 # ---------------------------------------------------------------------------
@@ -1109,7 +1150,8 @@ class _ShardedDslashWrapper(nn.Module):
     Splits a full-lattice complex64 spinor along T into ``num_shards``
     slabs, gathers one-slab halos from neighbour shards under periodic
     boundary conditions, dispatches each shard's compiled adapter
-    sequentially, and concatenates the per-shard outputs along T.
+    (concurrently when more than one is provided), and concatenates
+    the per-shard outputs along T.
 
     Args:
         shard_modules:    List of compiled (or eager) shard adapters,
@@ -1119,6 +1161,14 @@ class _ShardedDslashWrapper(nn.Module):
         num_shards:       Number of T-slabs.
         T_local:          Sites per slab (T // num_shards).
         compute_dtype:    Internal real dtype for the dispatched call.
+        dispatch_workers: Maximum number of host threads used to fire the
+                          per-shard NEFF calls concurrently.  Defaults to
+                          ``num_shards`` (one thread per shard).  When the
+                          per-shard NEFFs are pinned to distinct NeuronCores
+                          (see ``compile_dslash_sharded``) this turns the
+                          previously-sequential 8× dispatch into a single
+                          concurrent fan-out.  Set to 1 to force the
+                          legacy serial loop.
     """
 
     def __init__(
@@ -1127,6 +1177,7 @@ class _ShardedDslashWrapper(nn.Module):
         num_shards: int,
         T_local: int,
         compute_dtype: torch.dtype = torch.float32,
+        dispatch_workers: Optional[int] = None,
     ) -> None:
         super().__init__()
         # Use a plain Python list to avoid nn.ModuleList trying to register
@@ -1135,6 +1186,24 @@ class _ShardedDslashWrapper(nn.Module):
         self.num_shards = num_shards
         self.T_local = T_local
         self._compute_dtype = compute_dtype
+        # One worker per shard by default — the per-shard NEFFs are
+        # independent (no cross-shard tensors) and the Neuron runtime
+        # handles concurrent invocations, so a thread pool the same size
+        # as the shard count gives full overlap when shards are pinned
+        # to distinct NeuronCores.  Lazily constructed so a wrapper that
+        # is never called (e.g. instantiated and discarded by tests) does
+        # not spin up worker threads.
+        self._dispatch_workers = dispatch_workers or num_shards
+        self._executor: Optional["ThreadPoolExecutor"] = None
+
+    def _get_executor(self):
+        if self._executor is None and self._dispatch_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._dispatch_workers,
+                thread_name_prefix="lqcd-shard",
+            )
+        return self._executor
 
     @torch.inference_mode()
     def forward(self, psi: torch.Tensor, U: torch.Tensor = None) -> torch.Tensor:
@@ -1153,12 +1222,12 @@ class _ShardedDslashWrapper(nn.Module):
         psi_re = psi.real.to(dt).contiguous()
         psi_im = psi.imag.to(dt).contiguous()
 
-        out_re_shards = []
-        out_im_shards = []
-        for s, shard_mod in enumerate(self._shard_modules):
+        # Build the per-shard argument tuples up front so the dispatch
+        # loop only does the (potentially-blocking) NEFF calls.
+        shard_args = []
+        for s in range(self.num_shards):
             t0 = s * self.T_local
             t1 = t0 + self.T_local
-
             local_re = psi_re[t0:t1].contiguous()
             local_im = psi_im[t0:t1].contiguous()
 
@@ -1169,10 +1238,30 @@ class _ShardedDslashWrapper(nn.Module):
             hl_im = psi_im[l_idx:l_idx + 1].contiguous()
             hr_re = psi_re[r_idx:r_idx + 1].contiguous()
             hr_im = psi_im[r_idx:r_idx + 1].contiguous()
+            shard_args.append((local_re, local_im, hl_re, hl_im, hr_re, hr_im))
 
-            r_re, r_im = shard_mod(local_re, local_im, hl_re, hl_im, hr_re, hr_im)
-            out_re_shards.append(r_re.float())
-            out_im_shards.append(r_im.float())
+        executor = self._get_executor()
+        if executor is None or self.num_shards == 1:
+            # Legacy serial path — useful for CPU eager modules and for
+            # the dispatch_workers=1 override.
+            results = [
+                self._shard_modules[s](*shard_args[s])
+                for s in range(self.num_shards)
+            ]
+        else:
+            # Fan out all shard NEFF calls concurrently.  The Neuron
+            # runtime supports concurrent invocations across distinct
+            # compiled models; when each NEFF was pinned to its own
+            # NeuronCore at compile time (see compile_dslash_sharded)
+            # this overlaps the per-shard compute on real cores.
+            futures = [
+                executor.submit(self._shard_modules[s], *shard_args[s])
+                for s in range(self.num_shards)
+            ]
+            results = [f.result() for f in futures]
+
+        out_re_shards = [r_re.float() for r_re, _ in results]
+        out_im_shards = [r_im.float() for _, r_im in results]
 
         out_re = torch.cat(out_re_shards, dim=0)
         out_im = torch.cat(out_im_shards, dim=0)
@@ -2053,6 +2142,30 @@ class NeuronCompiler:
                 retries_done += 1
                 sharded_retry = True
 
+        # Best-effort: pin each per-shard NEFF to its own NeuronCore so
+        # the host-side ThreadPoolExecutor fan-out in
+        # _ShardedDslashWrapper actually overlaps compute on real cores
+        # rather than serialising on core 0.  Silently no-ops on older
+        # Neuron SDKs that lack set_neuron_cores.
+        total_cores = max(1, self._device.num_cores)
+        pinned_count = 0
+        for s, mod in enumerate(shard_modules):
+            if _try_pin_to_neuron_core(mod, s, total_cores):
+                pinned_count += 1
+        if pinned_count > 0:
+            logger.info(
+                "compile_dslash_sharded: pinned %d/%d per-shard NEFFs across "
+                "%d NeuronCores for parallel dispatch.",
+                pinned_count, len(shard_modules), total_cores,
+            )
+        elif total_cores > 1:
+            logger.info(
+                "compile_dslash_sharded: NeuronCore pinning unavailable — "
+                "shard NEFFs will share core 0 (set_neuron_cores not "
+                "exposed by this torch_neuronx build).  Concurrent "
+                "dispatch still removes Python overhead.",
+            )
+
         return _attach_compile_info(
             _ShardedDslashWrapper(
                 shard_modules,
@@ -2069,7 +2182,9 @@ class NeuronCompiler:
             num_shards=int(num_shards),
             T_local=int(T_local),
             batch_size=1,
-            num_cores=1,
+            num_cores=int(min(total_cores, len(shard_modules)))
+                if pinned_count > 0 else 1,
+            pinned_cores=int(pinned_count),
         )
 
     def compile_observable(
@@ -2269,6 +2384,54 @@ class NeuronCompiler:
             diag = 4.0 + dslash_module.mass
         else:
             diag = 0.0
+
+        # Guard rail: the fused multi-RHS adapter has the same SRAM and
+        # HLO-budget overflow modes as compile_dslash_batched.  At
+        # V > _DEFAULT_SHARD_VOLUME_CAP or kernels > SRAM the
+        # _FusedBatchedDslashAdapter compile is guaranteed to fail with
+        # NCC_EVRF007 / exit code 70.  Rather than crash and surface a
+        # ``[batched failed]`` annotation in the bench table, fall back
+        # to a host-loop wrapper around the single-RHS sharded module.
+        # This mirrors the compile_dslash_batched fallback chain.
+        kb = _fused_kernel_bytes(lattice_shape, ns=ns, nc=nc, dtype=dt)
+        sram_budget = (
+            self.sram_threshold_bytes
+            or int(_NC2_SRAM_BYTES * _FUSED_SRAM_BUDGET)
+        )
+        V = T * Z * Y * X
+        if kb > sram_budget or V > _DEFAULT_SHARD_VOLUME_CAP:
+            logger.warning(
+                "compile_dslash_multicore: fused kernels (%.1f MiB) exceed "
+                "SRAM budget (%.1f MiB) or V=%d exceeds per-NEFF HLO budget "
+                "(cap=%d sites) for lattice %s — falling back to a "
+                "host-side loop over a sharded single-RHS NEFF (no "
+                "DataParallel replication).  Per-RHS dispatch overhead is "
+                "no longer amortised across the global batch.",
+                kb / 1024**2, sram_budget / 1024**2,
+                V, _DEFAULT_SHARD_VOLUME_CAP, lattice_shape,
+            )
+            single = self.compile_dslash(
+                dslash_module, lattice_shape, nc=nc, ns=ns,
+                gauge_field=gauge_field, fused=True,
+            )
+            return _attach_compile_info(
+                _HostLoopBatchedWrapper(single),
+                kernel=getattr(single, "lqcd_compile_info", {}).get(
+                    "kernel", "sharded"
+                ),
+                lattice_shape=tuple(lattice_shape),
+                fused_fallback=True,
+                sharded_fallback=True,
+                multicore_host_loop=True,
+                num_shards=getattr(single, "lqcd_compile_info", {}).get(
+                    "num_shards", 1
+                ),
+                T_local=getattr(single, "lqcd_compile_info", {}).get(
+                    "T_local", T
+                ),
+                batch_size=int(num_cores * per_core_batch_size),
+                num_cores=int(num_cores),
+            )
 
         K_fwd_re, K_fwd_im, K_bwd_re, K_bwd_im = _build_dslash_kernels(
             gauge_field, nc=nc, ns=ns, dtype=dt,
