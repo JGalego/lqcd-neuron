@@ -14,6 +14,7 @@ from lqcd_neuron.core import ColorSpinorField, GaugeField, LatticeGeometry
 from lqcd_neuron.dirac import WilsonDirac, WilsonDslash
 from lqcd_neuron.neuron.compiler import (
     _BatchedUnbakedShardedAdapter,
+    _SHARD_VOLUME_CAP_OPT1,
     _ShardedBakedGaugeAdapter,
     _ShardedDslashWrapper,
     _auto_num_shards,
@@ -113,10 +114,22 @@ def test_auto_num_shards(shape, expected):
     assert _auto_num_shards(shape) == expected
 
 
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ((24, 24, 24, 24), 4),     # V=331,776 / 150k → 4 shards (T_local=6)
+        ((32, 32, 32, 32), 8),     # V=1,048,576 / 150k → 8 shards (T_local=4)
+    ],
+)
+def test_auto_num_shards_opt1_cap(shape, expected):
+    """Verify that optlevel=1 cap allows fewer shards for large lattices."""
+    assert _auto_num_shards(shape, cap=_SHARD_VOLUME_CAP_OPT1) == expected
+
+
 @pytest.mark.parametrize("num_shards", [2, 4])
 @pytest.mark.parametrize("op_cls", [WilsonDslash, WilsonDirac])
 def test_batched_sharded_matches_full_volume(num_shards, op_cls):
-    """Batched single-NEFF sharded path must equal the eager full-volume op."""
+    """Batched adapter CPU path must equal the eager full-volume op."""
     geom = LatticeGeometry(T=8, Z=4, Y=4, X=4)
     shape = (geom.T, geom.Z, geom.Y, geom.X)
     U = GaugeField.random(geom, seed=42).tensor
@@ -132,16 +145,42 @@ def test_batched_sharded_matches_full_volume(num_shards, op_cls):
     expected = D(psi, U)
 
     T_local, num_shards = _shard_T_indices(geom.T, num_shards)
-    batched_adapter = _BatchedUnbakedShardedAdapter(diag=diag, nc=3)
-    wrapper = _ShardedDslashWrapper(
-        [],
-        num_shards=num_shards,
-        T_local=T_local,
-        compute_dtype=torch.float32,
-        gauge_field=U,
-        batched_module=batched_adapter,
+    dt = torch.float32
+    T = geom.T
+    adapter = _BatchedUnbakedShardedAdapter(diag=diag, nc=3)
+
+    # Prepare batched inputs: (S, T_local, Z, Y, X, ...).
+    psi_re = psi.real.to(dt)
+    psi_im = psi.imag.to(dt)
+    slab_re = psi_re.view(num_shards, T_local, *psi_re.shape[1:])
+    slab_im = psi_im.view(num_shards, T_local, *psi_im.shape[1:])
+
+    l_indices = [((s * T_local) - 1) % T for s in range(num_shards)]
+    r_indices = [((s * T_local) + T_local) % T for s in range(num_shards)]
+    hl_re = torch.stack([psi_re[i:i+1] for i in l_indices], dim=0)
+    hl_im = torch.stack([psi_im[i:i+1] for i in l_indices], dim=0)
+    hr_re = torch.stack([psi_re[i:i+1] for i in r_indices], dim=0)
+    hr_im = torch.stack([psi_im[i:i+1] for i in r_indices], dim=0)
+
+    # Gauge slices.
+    gauge_slices = [
+        _slice_shard_gauge(U, s, num_shards, dtype=dt)
+        for s in range(num_shards)
+    ]
+    U_stacked_re = torch.stack([g[0] for g in gauge_slices], dim=0)
+    U_stacked_im = torch.stack([g[1] for g in gauge_slices], dim=0)
+    Utm1_stacked_re = torch.stack([g[2] for g in gauge_slices], dim=0)
+    Utm1_stacked_im = torch.stack([g[3] for g in gauge_slices], dim=0)
+
+    r_re, r_im = adapter(
+        slab_re, slab_im,
+        U_stacked_re, U_stacked_im,
+        Utm1_stacked_re, Utm1_stacked_im,
+        hl_re, hl_im, hr_re, hr_im,
     )
-    got = wrapper(psi)
+    out_re = r_re.reshape(T, *r_re.shape[2:]).float()
+    out_im = r_im.reshape(T, *r_im.shape[2:]).float()
+    got = torch.complex(out_re, out_im)
 
     assert got.shape == expected.shape
     assert torch.allclose(got, expected, atol=ATOL), (
