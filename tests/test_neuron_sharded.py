@@ -13,6 +13,7 @@ import torch
 from lqcd_neuron.core import ColorSpinorField, GaugeField, LatticeGeometry
 from lqcd_neuron.dirac import WilsonDirac, WilsonDslash
 from lqcd_neuron.neuron.compiler import (
+    _BatchedUnbakedShardedAdapter,
     _ShardedBakedGaugeAdapter,
     _ShardedDslashWrapper,
     _auto_num_shards,
@@ -110,3 +111,39 @@ def test_sharded_rejects_non_divisible_T():
 )
 def test_auto_num_shards(shape, expected):
     assert _auto_num_shards(shape) == expected
+
+
+@pytest.mark.parametrize("num_shards", [2, 4])
+@pytest.mark.parametrize("op_cls", [WilsonDslash, WilsonDirac])
+def test_batched_sharded_matches_full_volume(num_shards, op_cls):
+    """Batched single-NEFF sharded path must equal the eager full-volume op."""
+    geom = LatticeGeometry(T=8, Z=4, Y=4, X=4)
+    shape = (geom.T, geom.Z, geom.Y, geom.X)
+    U = GaugeField.random(geom, seed=42).tensor
+    psi = ColorSpinorField.gaussian(geom, seed=7).tensor
+
+    if op_cls is WilsonDirac:
+        D = WilsonDirac(mass=0.1, nc=3, dtype=torch.complex64)
+        diag = 4.0 + D.mass
+    else:
+        D = WilsonDslash(nc=3, dtype=torch.complex64)
+        diag = 0.0
+
+    expected = D(psi, U)
+
+    T_local, num_shards = _shard_T_indices(geom.T, num_shards)
+    batched_adapter = _BatchedUnbakedShardedAdapter(diag=diag, nc=3)
+    wrapper = _ShardedDslashWrapper(
+        [],
+        num_shards=num_shards,
+        T_local=T_local,
+        compute_dtype=torch.float32,
+        gauge_field=U,
+        batched_module=batched_adapter,
+    )
+    got = wrapper(psi)
+
+    assert got.shape == expected.shape
+    assert torch.allclose(got, expected, atol=ATOL), (
+        f"max abs diff = {(got - expected).abs().max().item():.3e}"
+    )
