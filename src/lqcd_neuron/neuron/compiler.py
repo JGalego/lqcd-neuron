@@ -1004,6 +1004,14 @@ class _ShardedBakedGaugeAdapter(nn.Module):
     For Z/Y/X axes ``torch.roll`` works locally.  For the T axis, the
     forward/backward neighbours are spliced in via ``torch.cat`` so no
     wrap-around occurs at the shard boundary.
+
+    Uses the **half-spinor trick**: the colour-matrix multiply is applied
+    to a 2-component projected spinor instead of the full 4-component
+    spinor, halving the cost of the einsums that dominate the per-site
+    HLO instruction count.  The spin projection and reconstruction are
+    done with element-wise adds/negations (exploiting the rank-2 structure
+    of the DeGrand-Rossi projectors) and compile to far fewer HLO
+    instructions than the previous ``_spin_mv`` einsum path.
     """
 
     def __init__(
@@ -1021,16 +1029,9 @@ class _ShardedBakedGaugeAdapter(nn.Module):
         self.diag = float(diag)
         self.nc = nc
 
-        # Spin projectors — same construction as _NeuronWilsonDslashAdapter.
-        from ..dirac.gamma import degrand_rossi_gammas
-        G  = degrand_rossi_gammas(dtype=torch.complex64)
-        I4 = torch.eye(4, dtype=torch.complex64)
-        P_minus = torch.stack([I4 - G[mu] for mu in range(4)], dim=0)
-        P_plus  = torch.stack([I4 + G[mu] for mu in range(4)], dim=0)
-        self.register_buffer("P_minus_re", P_minus.real.float())
-        self.register_buffer("P_minus_im", P_minus.imag.float())
-        self.register_buffer("P_plus_re",  P_plus.real.float())
-        self.register_buffer("P_plus_im",  P_plus.imag.float())
+    # ------------------------------------------------------------------
+    # Colour-matrix × (half-)spinor products
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _color_mv(U_re, U_im, v_re, v_im):
@@ -1048,13 +1049,93 @@ class _ShardedBakedGaugeAdapter(nn.Module):
                 - torch.einsum("...ji,...sj->...si", U_im, v_re))
         return r_re, r_im
 
+    # ------------------------------------------------------------------
+    # Half-spinor projection / reconstruction
+    #
+    # For the DeGrand-Rossi basis, the projectors P^s_μ = I + s·γ_μ
+    # (s = +1 for P⁺, s = -1 for P⁻) are rank-2 matrices.  Only 2 of
+    # the 4 output spin components are independent (rows 0, 1); rows 2
+    # and 3 are fixed linear combinations with coefficients in {±1, ±i}.
+    #
+    # Projection:  χ = first 2 independent rows of P^s · ψ
+    #   → 2 element-wise adds per half-spinor component (one add per re
+    #     and im, or an im↔re swap for ×i terms).
+    #
+    # Reconstruction:  full result[0..3] from coloured half-spinor φ
+    #   → result[0] = φ[0], result[1] = φ[1]
+    #   → result[2], result[3] = simple copies / negations / im↔re swaps
+    #     of φ[0] or φ[1].
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _spin_mv(P_re, P_im, v_re, v_im):
-        r_re = (torch.einsum("ij,...jk->...ik", P_re, v_re)
-                - torch.einsum("ij,...jk->...ik", P_im, v_im))
-        r_im = (torch.einsum("ij,...jk->...ik", P_re, v_im)
-                + torch.einsum("ij,...jk->...ik", P_im, v_re))
-        return r_re, r_im
+    def _half_project(psi_re, psi_im, mu, sign):
+        """Project full spinor (..., 4, Nc) → half-spinor (..., 2, Nc).
+
+        *sign* = -1 for P⁻ = I − γ_μ (forward hop),
+        *sign* = +1 for P⁺ = I + γ_μ (backward hop).
+        """
+        s0r, s0i = psi_re[..., 0, :], psi_im[..., 0, :]
+        s1r, s1i = psi_re[..., 1, :], psi_im[..., 1, :]
+        s2r, s2i = psi_re[..., 2, :], psi_im[..., 2, :]
+        s3r, s3i = psi_re[..., 3, :], psi_im[..., 3, :]
+        s = sign
+        if mu == 0:
+            # χ[0] = ψ[0] + s·i·ψ[3],  χ[1] = ψ[1] + s·i·ψ[2]
+            h0r = s0r - s * s3i
+            h0i = s0i + s * s3r
+            h1r = s1r - s * s2i
+            h1i = s1i + s * s2r
+        elif mu == 1:
+            # χ[0] = ψ[0] − s·ψ[3],  χ[1] = ψ[1] + s·ψ[2]
+            h0r = s0r - s * s3r
+            h0i = s0i - s * s3i
+            h1r = s1r + s * s2r
+            h1i = s1i + s * s2i
+        elif mu == 2:
+            # χ[0] = ψ[0] + s·i·ψ[2],  χ[1] = ψ[1] − s·i·ψ[3]
+            h0r = s0r - s * s2i
+            h0i = s0i + s * s2r
+            h1r = s1r + s * s3i
+            h1i = s1i - s * s3r
+        else:  # mu == 3
+            # χ[0] = ψ[0] + s·ψ[2],  χ[1] = ψ[1] + s·ψ[3]
+            h0r = s0r + s * s2r
+            h0i = s0i + s * s2i
+            h1r = s1r + s * s3r
+            h1i = s1i + s * s3i
+        return (
+            torch.stack([h0r, h1r], dim=-2),
+            torch.stack([h0i, h1i], dim=-2),
+        )
+
+    @staticmethod
+    def _half_recon(c_re, c_im, mu, sign):
+        """Reconstruct full spinor (..., 4, Nc) from coloured half (..., 2, Nc)."""
+        c0r, c0i = c_re[..., 0, :], c_im[..., 0, :]
+        c1r, c1i = c_re[..., 1, :], c_im[..., 1, :]
+        s = sign
+        if mu == 0:
+            # result[2] = −s·i·φ[1],  result[3] = −s·i·φ[0]
+            r2r =  s * c1i;  r2i = -s * c1r
+            r3r =  s * c0i;  r3i = -s * c0r
+        elif mu == 1:
+            # result[2] = s·φ[1],  result[3] = −s·φ[0]
+            r2r =  s * c1r;  r2i =  s * c1i
+            r3r = -s * c0r;  r3i = -s * c0i
+        elif mu == 2:
+            # result[2] = −s·i·φ[0],  result[3] = s·i·φ[1]
+            r2r =  s * c0i;  r2i = -s * c0r
+            r3r = -s * c1i;  r3i =  s * c1r
+        else:  # mu == 3
+            # result[2] = s·φ[0],  result[3] = s·φ[1]
+            r2r = s * c0r;  r2i = s * c0i
+            r3r = s * c1r;  r3i = s * c1i
+        return (
+            torch.stack([c0r, c1r, r2r, r3r], dim=-2),
+            torch.stack([c0i, c1i, r2i, r3i], dim=-2),
+        )
+
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -1068,20 +1149,13 @@ class _ShardedBakedGaugeAdapter(nn.Module):
         for mu in range(4):
             U_mu_re = self.U_local_re[..., mu, :, :]
             U_mu_im = self.U_local_im[..., mu, :, :]
-            # Lattice axes T,Z,Y,X live at positions -6..-3 of psi.
             ldim = mu - 6
 
             if mu == 0:
-                # T axis: splice halos instead of rolling.
-                #   pf[t] = psi[t+1] for t<T_local-1, hr[0] for t=T_local-1
-                #   pb[t] = psi[t-1] for t>0,        hl[0] for t=0
                 pf_re = torch.cat([psi_re[1:], hr_re], dim=0)
                 pf_im = torch.cat([psi_im[1:], hr_im], dim=0)
                 pb_re = torch.cat([hl_re, psi_re[:-1]], dim=0)
                 pb_im = torch.cat([hl_im, psi_im[:-1]], dim=0)
-                # Backward link U†(t-1, μ=0) at output site t:
-                #   for local t=0    → U_tm1_mu0 (baked from previous shard)
-                #   for local t>0    → U_local at local t-1, μ=0
                 Ub_re = torch.cat([self.U_tm1_mu0_re, U_mu_re[:-1]], dim=0)
                 Ub_im = torch.cat([self.U_tm1_mu0_im, U_mu_im[:-1]], dim=0)
             else:
@@ -1093,15 +1167,21 @@ class _ShardedBakedGaugeAdapter(nn.Module):
                 Ub_im = torch.roll(U_mu_im, 1, dims=ldim)
 
             # Forward hop:  − ½ (I − γ_μ) U(x,μ) ψ(x+μ̂)
-            Upf_re, Upf_im = self._color_mv(U_mu_re, U_mu_im, pf_re, pf_im)
-            cf_re,  cf_im  = self._spin_mv(
-                self.P_minus_re[mu], self.P_minus_im[mu], Upf_re, Upf_im
+            #  1) project ψ(x+μ̂) → 2-component half-spinor
+            hf_re, hf_im = self._half_project(pf_re, pf_im, mu, -1)
+            #  2) colour-multiply on half-spinor (half the einsums)
+            Uhf_re, Uhf_im = self._color_mv(
+                U_mu_re, U_mu_im, hf_re, hf_im
             )
+            #  3) reconstruct full 4-component result
+            cf_re, cf_im = self._half_recon(Uhf_re, Uhf_im, mu, -1)
+
             # Backward hop: − ½ (I + γ_μ) U†(x−μ̂,μ) ψ(x−μ̂)
-            Upb_re, Upb_im = self._color_dag_mv(Ub_re, Ub_im, pb_re, pb_im)
-            cb_re,  cb_im  = self._spin_mv(
-                self.P_plus_re[mu], self.P_plus_im[mu], Upb_re, Upb_im
+            hb_re, hb_im = self._half_project(pb_re, pb_im, mu, +1)
+            Uhb_re, Uhb_im = self._color_dag_mv(
+                Ub_re, Ub_im, hb_re, hb_im
             )
+            cb_re, cb_im = self._half_recon(Uhb_re, Uhb_im, mu, +1)
 
             result_re = result_re - 0.5 * (cf_re + cb_re)
             result_im = result_im - 0.5 * (cf_im + cb_im)
